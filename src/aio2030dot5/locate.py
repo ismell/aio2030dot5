@@ -8,9 +8,13 @@ SFDI (or LFDI) and find its current address when needed::
         meter = Meter(adv.host, ctx, adv.port, expected_lfdi=lfdi)
 
 The SFDI in an advertisement is only a hint; ``expected_lfdi`` makes the
-connection prove it. Pass the application's shared ``AsyncZeroconf`` (Home
-Assistant: ``await zeroconf.async_get_async_instance(hass)``) rather than
-creating one per lookup. Across subnets, mDNS needs a repeater or reflector.
+connection prove it. Lookup by SFDI relies on the Itron convention of naming
+the instance ``itrondnsserver-<SFDI>``; for other servers, ``async_browse``
+and probe each candidate (``Meter.probe_tls``) for the meter's LFDI.
+
+Pass the application's shared ``AsyncZeroconf`` (Home Assistant:
+``await zeroconf.async_get_async_instance(hass)``) rather than creating one
+per lookup. Across subnets, mDNS needs a repeater or reflector.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ async def async_browse(aiozc: AsyncZeroconf, *, listen: float = 5.0) -> list[Adv
 async def async_locate(aiozc: AsyncZeroconf, sfdi: str, *, listen: float = 5.0) -> Advertisement | None:
     """The advertisement whose instance name carries ``sfdi``, or None if it
     is not heard within ``listen`` seconds. Returns as soon as it is found."""
-    found = await _browse(aiozc, listen, str(sfdi))
+    found = await _browse(aiozc, listen, str(int(str(sfdi))))
     return found[0] if found else None
 
 

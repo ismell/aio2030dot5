@@ -288,7 +288,7 @@ class SelfDevice:
     def from_xml(cls, root: ET.Element) -> SelfDevice:
         expect_root(root, "SelfDevice")
         return cls(
-            sfdi=text(root, "sFDI"),
+            sfdi=_sfdi(text(root, "sFDI")),
             lfdi=text(root, "lFDI"),
             device_information_href=link(root, "DeviceInformationLink"),
         )
@@ -751,3 +751,11 @@ def _from_iso(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         raise ValueError(f"timestamp without a timezone: {value!r}")
     return parsed
+
+
+def _sfdi(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    if not value.strip().isascii() or not value.strip().isdigit():
+        raise MeterProtocolError(f"sFDI is not a number: {value!r}")
+    return str(int(value))  # agents may zero-pad it

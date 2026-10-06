@@ -11,12 +11,13 @@ import asyncio
 import dataclasses
 import logging
 import ssl
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .exceptions import MeterAuthError, MeterNotFound, MeterProtocolError, ProfileError
+from .exceptions import MeterAuthError, MeterError, MeterNotFound, MeterProtocolError, ProfileError
 from .identity import Identity
 from .models import (
     DeviceInformation,
@@ -28,7 +29,9 @@ from .models import (
     TouRegister,
     _from_iso,
     _iso,
+    children,
     interval_values,
+    local_name,
     parse_xml,
 )
 from .profile import Channel, MeterInfo, MeterProfile, Statistic, discover, get_list, read_meter_info, resolve_href
@@ -73,6 +76,9 @@ class MeterSnapshot:
     # ToU registers by channel key. Tier 0 is the total.
     tou: dict[str, TouRegister] = field(default_factory=dict)
     meter_time: MeterTime | None = None
+    # read(partial=True) only: channels that failed, and why. A
+    # MeterNotFound here means the profile is stale (rediscover).
+    errors: dict[str, MeterError] = field(default_factory=dict)
 
     @property
     def clock_skew(self) -> timedelta | None:
@@ -88,6 +94,7 @@ class MeterSnapshot:
             "values": {k: m.to_dict() for k, m in self.values.items()},
             "tou": {k: r.to_dict() for k, r in self.tou.items()},
             "meter_time": self.meter_time.to_dict() if self.meter_time else None,
+            "errors": {k: f"{type(e).__name__}: {e}" for k, e in self.errors.items()},
         }
 
     @classmethod
@@ -100,6 +107,7 @@ class MeterSnapshot:
             values={k: Measurement.from_dict(m) for k, m in d.get("values", {}).items()},
             tou={k: TouRegister.from_dict(r) for k, r in d.get("tou", {}).items()},
             meter_time=MeterTime.from_dict(d["meter_time"]) if d.get("meter_time") else None,
+            errors={k: MeterProtocolError(str(m)) for k, m in d.get("errors", {}).items()},
         )
 
 
@@ -271,29 +279,42 @@ class Meter:
         channels: Iterable[Channel],
         *,
         include_time: bool = False,
+        partial: bool = False,
     ) -> MeterSnapshot:
         """Read the latest value of each channel in one batch.
 
         Interval channels are skipped; use :meth:`read_latest_intervals`.
         Raises ``MeterNotFound`` if a profiled path vanished (rediscover).
+
+        ``partial``: a channel the meter answers with an error or something
+        unparsable (``MeterProtocolError``, incl. ``MeterNotFound``) is left
+        out and recorded in ``snapshot.errors`` instead of failing the whole
+        batch. Connection, timeout, busy and authentication errors still
+        raise: they concern the meter, not a channel.
         """
         self._pin(profile)
         values: dict[str, Measurement] = {}
         tou: dict[str, TouRegister] = {}
+        errors: dict[str, MeterError] = {}
         meter_time = None
         async with self.transport.batch() as b:
             # Taken once the lock is ours, not while queued behind another batch.
             fetched_at = datetime.now(UTC)
             for ch in channels:
-                if ch.statistic == Statistic.TOU_SUMMATION and ch.tou_reading_list_href:
-                    tou[ch.key] = await _read_tou(b, ch)
-                elif ch.reading_href and ch.statistic != Statistic.INTERVAL:
-                    reading = Reading.from_xml(parse_xml(await b.get(ch.reading_href)))
-                    values[ch.key] = Measurement.of(reading, ch.reading_type)
+                try:
+                    if ch.statistic == Statistic.TOU_SUMMATION and ch.tou_reading_list_href:
+                        tou[ch.key] = await _read_tou(b, ch)
+                    elif ch.reading_href and ch.statistic != Statistic.INTERVAL:
+                        reading = _latest_reading(parse_xml(await b.get(ch.reading_href)))
+                        values[ch.key] = Measurement.of(reading, ch.reading_type)
+                except MeterProtocolError as err:
+                    if not partial:
+                        raise
+                    errors[ch.key] = err
             if include_time and profile.time_href:
                 meter_time = MeterTime.from_xml(parse_xml(await b.get(profile.time_href)))
                 fetched_at = datetime.now(UTC)
-        return MeterSnapshot(fetched_at=fetched_at, values=values, tou=tou, meter_time=meter_time)
+        return MeterSnapshot(fetched_at=fetched_at, values=values, tou=tou, meter_time=meter_time, errors=errors)
 
     # -- interval data -----------------------------------------------------------
     #
@@ -372,9 +393,23 @@ class Meter:
 
 def _require_interval(channel: Channel) -> str:
     """The channel's ReadingSetList href; ValueError if it is not interval data."""
-    if channel.statistic != Statistic.INTERVAL or not channel.reading_set_list_href:
+    if channel.statistic != Statistic.INTERVAL:
         raise ValueError(f"{channel.key} is not an interval channel")
+    if not channel.reading_set_list_href:
+        raise ValueError(f"{channel.key} is interval data, but the meter links no ReadingSets for it")
     return channel.reading_set_list_href
+
+
+def _latest_reading(root: ET.Element) -> Reading:
+    """A MeterReading's ReadingLink names one Reading. Some servers answer
+    with a ReadingList instead: take its newest Reading."""
+    if local_name(root.tag) != "ReadingList":
+        return Reading.from_xml(root)
+    readings = [Reading.from_xml(e) for e in children(root, "Reading")]
+    if not readings:
+        raise MeterProtocolError("ReadingList holds no Reading")
+    newest = datetime.min.replace(tzinfo=UTC)
+    return max(readings, key=lambda r: r.start or newest)
 
 
 async def _read_tou(b: Batch, ch: Channel) -> TouRegister:

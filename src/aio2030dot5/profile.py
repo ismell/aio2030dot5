@@ -47,6 +47,7 @@ from .transport import Batch
 _LOGGER = logging.getLogger(__name__)
 
 PROFILE_VERSION = 3
+ITRON_PEN = 1233  # DeviceInformation.mfID: the vendor's IANA enterprise number
 # Bump whenever classify() or the key format changes in a way that could
 # change an existing channel's key; cached profiles from another scheme are
 # rejected so the consumer rediscovers (and can map old keys to new ones).
@@ -122,15 +123,19 @@ _PHASES = {
 WHOLE_METER_PHASES = (0, 224)
 
 
-def classify(rt: ReadingType, description: str | None = None) -> tuple[Quantity, Statistic, Direction]:
-    """What a MeterReading measures, from its ReadingType, with its
-    description breaking ties the ReadingType leaves open.
+def classify(
+    rt: ReadingType, description: str | None = None, *, itron: bool = True
+) -> tuple[Quantity, Statistic, Direction]:
+    """What a MeterReading measures, from its ReadingType -- and, for Itron
+    agents (``itron``), its description breaking ties the ReadingType leaves
+    open.
 
     Description rules exist because Itron agents publish ReadingTypes that
     are not distinguishable on their own: before 3.2.50 the ToU and plain
     summation registers have identical ReadingTypes, and older v3 agents
     give "WH Net (Interval)" flowDirection 1 (delivered). Itron's own SDK
-    tells them apart by description the same way.
+    tells them apart by description the same way. Descriptions are free text,
+    so other vendors' are not interpreted.
     """
     quantity = _QUANTITY_BY_UOM.get(Uom(rt.uom), Quantity.OTHER)
     direction = _DIRECTION.get(FlowDirection(rt.flow_direction), Direction.NONE)
@@ -149,7 +154,7 @@ def classify(rt: ReadingType, description: str | None = None) -> tuple[Quantity,
     else:
         statistic = Statistic.OTHER
 
-    if description:
+    if description and itron:
         words = set(re.findall(r"[a-z]+", description.lower()))
         if statistic in (Statistic.SUMMATION, Statistic.TOU_SUMMATION):
             if "tou" in words:
@@ -335,8 +340,12 @@ def resolve_href(base: str, href: str, host: str, port: int) -> str:
     """Resolve a link from the resource at ``base`` to an origin-form target.
 
     2030.5 links may be relative or absolute URIs. Relative ones resolve
-    against the resource they came from; absolute ones must point back at the
-    meter itself -- a link elsewhere is a protocol error, never followed.
+    against the resource they came from. An absolute one must be HTTP(S) on
+    the meter's port; its host is not compared, since a server may name
+    itself differently from the address we connected to (a hostname, another
+    of its addresses). Only the path is used, and it is requested on our own
+    connection -- the one whose certificate is pinned -- so nothing is ever
+    sent elsewhere. A link to another port is a protocol error.
     """
     bare = host.strip("[]").split("%", 1)[0].lower()  # IPv6 literal without zone
     origin = f"https://[{bare}]:{port}" if ":" in bare else f"https://{bare}:{port}"
@@ -345,8 +354,8 @@ def resolve_href(base: str, href: str, host: str, port: int) -> str:
         link_port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError as err:  # bad port, unbalanced brackets, ...
         raise MeterProtocolError(f"malformed link from meter: {href!r}") from err
-    if parts.scheme not in ("https", "http") or (parts.hostname or "").lower() != bare or link_port != port:
-        raise MeterProtocolError(f"link to another host: {href!r}")
+    if parts.scheme not in ("https", "http") or not parts.hostname or link_port != port:
+        raise MeterProtocolError(f"link to another server: {href!r}")
     return parts.path + (f"?{parts.query}" if parts.query else "")
 
 
@@ -546,20 +555,25 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
             continue
         mr_href = resolve(mr_list_href, mr.href) if mr.href else mr_list_href
         rt = ReadingType.from_xml(parse_xml(await batch.get(resolve(mr_href, mr.reading_type_href))))
-        q, s, d = classify(rt, mr.description)
+        q, s, d = classify(rt, mr.description, itron=meter.manufacturer_id == ITRON_PEN)
         set_list_href = resolve(mr_href, mr.reading_set_list_href) if mr.reading_set_list_href else None
         tou_list: str | None = None
         tiers: tuple[int, ...] = ()
         if s == Statistic.TOU_SUMMATION:
             tagged = False
             if set_list_href:
-                tou_list, tiers, tagged = await _discover_tou(batch, set_list_href, host, port)
-            if not tagged and "tou" not in (mr.description or "").lower():
-                # numberOfTouTiers > 0 but no reading carries a touTier and the
-                # description does not say ToU: a plain register.
+                try:
+                    tou_list, tiers, tagged = await _discover_tou(batch, set_list_href, host, port)
+                except MeterProtocolError as err:  # incl. 404: an optional resource
+                    _LOGGER.warning("%s: cannot read its ToU tiers (%s); treating it as a plain register", mr_href, err)
+            if not tagged:
+                # Only readings tagged with a touTier make a ToU register: a
+                # ReadingType or a description saying so is not enough.
                 s, tou_list, tiers = Statistic.SUMMATION, None, ()
         classified.append((mr, mr_href, rt, q, s, d, set_list_href, tou_list, tiers))
 
+    if not classified:
+        raise MeterProtocolError(f"{mr_list_href} lists no MeterReading with a ReadingType: nothing to read")
     keys = assign_keys([(mr, q, s, d, rt.phase) for mr, _, rt, q, s, d, *_ in classified])
     channels: list[Channel] = []
     for (key, ambiguous), (mr, mr_href, rt, q, s, d, set_list_href, tou_list, tiers) in zip(

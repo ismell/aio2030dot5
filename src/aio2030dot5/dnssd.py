@@ -99,7 +99,8 @@ def parse_advertisement(
 
     if txt.get("txtvers", "1") != "1":
         raise MeterProtocolError(f"unsupported txtvers {txt['txtvers']!r}")
-    dcap = txt.get("dcap") or "/dcap"
+    # "dcap" per IEEE 2030.5; some servers publish the path as "path" instead.
+    dcap = txt.get("dcap") or txt.get("path") or "/dcap"
     if not dcap.startswith("/") or dcap.startswith("//") or any(c.isspace() for c in dcap) or not dcap.isascii():
         raise MeterProtocolError(f"dcap is not a server path: {dcap!r}")
     https = _port(txt["https"], "TXT https") if txt.get("https") else _port(str(port), "SRV port")
@@ -107,7 +108,7 @@ def parse_advertisement(
         raise MeterProtocolError("advertisement has no address")
 
     m = _INSTANCE_SFDI.search(instance)
-    sfdi = m.group(1) if m and is_valid_sfdi(m.group(1)) else None
+    sfdi = str(int(m.group(1))) if m and is_valid_sfdi(m.group(1)) else None
     return Advertisement(
         instance=instance,
         host=host,

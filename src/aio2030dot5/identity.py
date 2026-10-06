@@ -48,6 +48,15 @@ def sfdi_from_lfdi(lfdi: str) -> str:
     return f"{digits}{check}"
 
 
+def canonical_sfdi(sfdi: str | int) -> str:
+    """An SFDI in one lexical form. It is an integer (UInt40): agents may
+    zero-pad it ("060044366894"), so compare canonical forms only."""
+    text = str(sfdi).strip()
+    if not text.isascii() or not text.isdigit():
+        raise ValueError(f"an SFDI is decimal digits, got {sfdi!r}")
+    return str(int(text))
+
+
 @dataclass(frozen=True, slots=True)
 class Identity:
     """A client certificate and its private key, as PEM text.
