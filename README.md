@@ -103,7 +103,7 @@ entry_data = {"identity": identity.to_dict(), "sfdi": adv.sfdi}  # secret: redac
 meter = await Meter.create(host, Identity.from_dict(entry_data["identity"]), dcap_path=adv.dcap_path)
 peer = await meter.probe_tls()          # who is there, even before registration
 if peer.client_accepted:
-    info = await meter.probe()          # 1-3 GETs: lFDI/sFDI, manufacturer, software version
+    info = await meter.probe()          # 1-3 GETs: lFDI/sFDI, manufacturer, model, serial, versions
 ```
 
 - **`Timeouts(batch=…)`** is a per-call deadline. It starts once the meter's lock is held, so time spent queued behind
@@ -112,6 +112,8 @@ if peer.client_accepted:
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
   faster than the service allows. It rebases on consistent new series, and records register resets in `.resets`.
 - **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
+- **`MeterProfile`** also keeps what the meter says it is (`model`, `serial_number`, `hardware_version`), None where the
+  meter leaves them empty, as Itron does.
 - **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, `MeterInfo` and `Identity`, for test
   fixtures and diagnostics.
 
@@ -121,7 +123,9 @@ The meter admits a client whose self-signed certificate's **LFDI** has been regi
 `aio2030dot5.identity` can:
 - generate a certificate in the profile an Itron meter accepts;
 - compute the LFDI and SFDI;
-- validate a certificate/key pair.
+- validate a certificate/key pair;
+- show an LFDI for a person to register: `format_lfdi()` gives eight groups of five hex digits, the only grouping
+  Xcel Energy's portal accepts besides none at all.
 
 These certificates have a 3-year life.
 

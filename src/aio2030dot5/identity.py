@@ -1,7 +1,8 @@
 """Client identity for IEEE 2030.5 HAN access: certificates, LFDI and SFDI.
 
 A HAN meter admits a client whose self-signed certificate's LFDI has been
-registered with the utility (for Xcel Energy, in the Launchpad portal). The
+registered with the utility (for Xcel Energy, under Meters and devices in
+My Account). The
 profile generated here mirrors a certificate an Itron Gen5 Riva meter is
 known to accept: P-256 / ECDSA-SHA256, CN=MeterReaderHanClient, critical
 basicConstraints CA:TRUE, critical keyUsage digitalSignature, and the
@@ -50,9 +51,14 @@ def sfdi_from_lfdi(lfdi: str) -> str:
 
 def format_lfdi(lfdi: str) -> str:
     """An LFDI for a person to read and register: eight groups of five hex
-    digits. Xcel Energy's portal accepts only this grouping, or none."""
-    lfdi = lfdi.replace("-", "").upper()
-    return "-".join(lfdi[i : i + 5] for i in range(0, len(lfdi), 5))
+    digits. Xcel Energy's portal accepts only this grouping, or none.
+
+    Accepts any grouping, case and surrounding whitespace; raises
+    ``ValueError`` unless 40 hex digits remain."""
+    digits = "".join(lfdi.split()).replace("-", "").upper()
+    if not re.fullmatch(r"[0-9A-F]{40}", digits):
+        raise ValueError(f"an LFDI is 40 hex digits, got {lfdi!r}")
+    return "-".join(digits[i : i + 5] for i in range(0, 40, 5))
 
 
 def canonical_sfdi(sfdi: str | int) -> str:

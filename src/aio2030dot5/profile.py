@@ -245,7 +245,9 @@ class Channel:
 def _optional_str(value: Any) -> str | None:
     if value is not None and not isinstance(value, str):
         raise TypeError(f"expected a string, got {value!r}")
-    return value or None
+    if value is None:
+        return None
+    return value.strip() or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,15 +333,15 @@ class MeterProfile:
             return cls(
                 host=d["host"],
                 port=d["port"],
-                meter_lfdi=d.get("meter_lfdi"),
-                meter_sfdi=d.get("meter_sfdi"),
+                meter_lfdi=_optional_str(d.get("meter_lfdi")),
+                meter_sfdi=_optional_str(d.get("meter_sfdi")),
                 manufacturer_id=d.get("manufacturer_id"),
-                software_version=d.get("software_version"),
-                time_href=d.get("time_href"),
+                software_version=_optional_str(d.get("software_version")),
+                time_href=_optional_str(d.get("time_href")),
                 usage_point_href=d["usage_point_href"],
                 poll_rate=int(d.get("poll_rate") or DEFAULT_POLL_RATE),
                 channels=tuple(Channel.from_dict(c) for c in d["channels"]),
-                device_information_href=d.get("device_information_href"),
+                device_information_href=_optional_str(d.get("device_information_href")),
                 certificate_lfdi=d.get("certificate_lfdi"),
                 model=_optional_str(d.get("model")),
                 serial_number=_optional_str(d.get("serial_number")),

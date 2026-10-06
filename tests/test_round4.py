@@ -127,6 +127,10 @@ def test_lfdi_as_utility_portals_accept_it() -> None:
     expected = "431ED-86C1F-202CD-D3FEB-3EF8D-CB9F4-457F0-EC47D"
     assert format_lfdi("431ED86C1F202CDD3FEB3EF8DCB9F4457F0EC47D") == expected
     assert format_lfdi("431e-d86c-1f20-2cdd-3feb-3ef8-dcb9-f445-7f0e-c47d") == expected
+    assert format_lfdi(" 431ED 86C1F 202CD D3FEB 3EF8D CB9F4 457F0 EC47D\n") == expected
+    for bad in ("ABCDEF", "431ED86C1F202CDD3FEB3EF8DCB9F4457F0EC47D00", "431ED86C1F202CDD3FEB3EF8DCB9F4457F0EC47G"):
+        with pytest.raises(ValueError):
+            format_lfdi(bad)
 
 
 def test_manufacturers() -> None:
@@ -158,8 +162,10 @@ async def test_the_profile_keeps_what_the_meter_says_it_is(pki: Pki) -> None:
     for key in ("model", "serial_number", "hardware_version"):
         del older[key]
     assert MeterProfile.from_dict(older).model is None
-    with pytest.raises(ProfileError):
-        MeterProfile.from_dict({**profile.to_dict(), "model": 5})
+    for key in ("model", "software_version", "meter_lfdi", "meter_sfdi", "time_href", "device_information_href"):
+        with pytest.raises(ProfileError):
+            MeterProfile.from_dict({**profile.to_dict(), key: 5})
+    assert MeterProfile.from_dict({**profile.to_dict(), "model": "  "}).model is None
 
 
 async def test_an_empty_device_information_is_none(pki: Pki, fake_meter: FakeMeter) -> None:
