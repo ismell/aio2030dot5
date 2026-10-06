@@ -22,12 +22,14 @@ import asyncio
 import logging
 import ssl
 import time
+import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 
 from .exceptions import (
     MeterAuthError,
+    MeterBusy,
     MeterConnectionError,
     MeterHttpError,
     MeterNotFound,
@@ -218,7 +220,7 @@ class _TlsConnection:
         try:
             self._ssl.write(data)
         except ssl.SSLError as err:
-            raise MeterConnectionError(f"TLS write failed: {err}") from err
+            raise _classify_ssl_error(err, handshake=False) from err
         await self._flush()
 
     async def _recv_some(self) -> bytes:
@@ -240,7 +242,10 @@ class _TlsConnection:
                 self.eof = True
                 return b""
             except ssl.SSLError as err:
-                raise MeterConnectionError(f"TLS read failed: {err}") from err
+                # An Itron meter completes the handshake with an unregistered
+                # certificate and sends bad_certificate ~0.5 s later, so an
+                # auth alert can arrive here, on the first read.
+                raise _classify_ssl_error(err, handshake=False) from err
 
     async def read_response(self) -> Response:
         """Read exactly one HTTP/1.1 response, framed by its own headers."""
@@ -372,26 +377,30 @@ class _EmptyResponse(MeterConnectionError):
         super().__init__(f"{msg} ({detail})" if detail else msg)
 
 
-def _classify_ssl_error(err: ssl.SSLError) -> Exception:
+# TLS alert (as OpenSSL names it in the reason) -> MeterAuthError.reason
+_AUTH_ALERTS = {
+    "BAD_CERTIFICATE": "certificate_rejected",
+    "CERTIFICATE_UNKNOWN": "certificate_rejected",
+    "UNKNOWN_CA": "certificate_rejected",
+    "UNSUPPORTED_CERTIFICATE": "certificate_rejected",
+    "CERTIFICATE_EXPIRED": "certificate_expired",
+    "CERTIFICATE_REVOKED": "certificate_revoked",
+    "ACCESS_DENIED": "access_denied",
+}
+
+
+def _classify_ssl_error(err: ssl.SSLError, *, handshake: bool = True) -> Exception:
     reason = (getattr(err, "reason", None) or str(err)).upper()
-    if "BAD_SIGNATURE" in reason:
+    if handshake and "BAD_SIGNATURE" in reason:
         return _BadSignature(str(err))
-    if any(
-        k in reason
-        for k in (
-            "BAD_CERTIFICATE",
-            "CERTIFICATE_UNKNOWN",
-            "CERTIFICATE_EXPIRED",
-            "UNKNOWN_CA",
-            "ACCESS_DENIED",
-            "CERTIFICATE_REVOKED",
-        )
-    ):
-        return MeterAuthError(
-            f"meter rejected the client certificate ({err}); check that its LFDI is "
-            "registered with the utility and that it has not expired"
-        )
-    return MeterConnectionError(f"TLS handshake failed: {err}")
+    for alert, auth_reason in _AUTH_ALERTS.items():
+        if alert in reason:
+            return MeterAuthError(
+                f"meter rejected the client certificate ({err}); check that its LFDI is "
+                "registered with the utility and that it has not expired",
+                reason=auth_reason,
+            )
+    return MeterConnectionError(f"TLS {'handshake' if handshake else 'connection'} failed: {err}")
 
 
 class _BadSignature(MeterConnectionError):
@@ -402,8 +411,27 @@ class _BadSignature(MeterConnectionError):
 
 
 @dataclass(slots=True)
-class _Pacing:
-    last_connect: float = field(default=-1e9)
+class _Shared:
+    """State shared by every transport to one (host, port) on one event loop.
+
+    The meter has one connection slot, so the one-connection rule must hold
+    across Meter objects too -- e.g. a Home Assistant re-auth probe built with
+    a new certificate while the entry's coordinator is polling, or the CLI.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_connect: float = -1e9
+    last_close: float = -1e9
+
+
+_SHARED: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, int], _Shared]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _shared(host: str, port: int) -> _Shared:
+    per_loop = _SHARED.setdefault(asyncio.get_running_loop(), {})
+    return per_loop.setdefault((host.lower(), port), _Shared())
 
 
 class MeterTransport:
@@ -431,19 +459,24 @@ class MeterTransport:
         self.timeouts = timeouts or Timeouts()
         self.min_connect_interval = min_connect_interval
         self.request_spacing = request_spacing
-        self._lock = asyncio.Lock()
         self._session: ssl.SSLSession | None = None
-        self._pacing = _Pacing()
         self.stats = TransportStats()
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        return _shared(self.host, self.port).lock
 
     def forget_session(self) -> None:
         self._session = None
 
     async def _connect(self) -> _TlsConnection:
-        wait = self._pacing.last_connect + self.min_connect_interval - time.monotonic()
+        shared = _shared(self.host, self.port)
+        # Spaced from the last connect AND the last close: a long batch must
+        # not be followed by a connect the instant it ends.
+        wait = max(shared.last_connect, shared.last_close) + self.min_connect_interval - time.monotonic()
         if wait > 0:
             await asyncio.sleep(wait)
-        self._pacing.last_connect = time.monotonic()
+        shared.last_connect = time.monotonic()
         t0 = time.monotonic()
         try:
             conn = await self._open_once()
@@ -453,7 +486,7 @@ class MeterTransport:
             self.stats.bad_signature_retries += 1
             _LOGGER.debug("BAD_SIGNATURE from %s; retrying handshake once", self.host)
             await asyncio.sleep(self.min_connect_interval)
-            self._pacing.last_connect = time.monotonic()
+            shared.last_connect = time.monotonic()
             t0 = time.monotonic()
             conn = await self._open_once()
         self.stats.last_handshake_ms = round((time.monotonic() - t0) * 1000)
@@ -510,6 +543,12 @@ class Batch:
         resp = await self.request(path)
         if resp.status in (404, 410):
             raise MeterNotFound(path, resp.status, resp.reason)
+        if resp.status in (401, 403):
+            raise MeterAuthError(
+                f"GET {path} -> HTTP {resp.status} {resp.reason}".rstrip(), reason=f"http_{resp.status}"
+            )
+        if resp.status in (429, 503):
+            raise MeterBusy(f"GET {path} -> HTTP {resp.status} {resp.reason}".rstrip())
         if not 200 <= resp.status < 300:
             raise MeterHttpError(path, resp.status, resp.reason)
         return resp.body
@@ -575,6 +614,8 @@ class Batch:
             # reset -- the connection may hold half a response. Drop it now,
             # synchronously, so it is never reused.
             self._kill()
+            if isinstance(err, MeterAuthError):
+                t.forget_session()  # never resume a session the meter rejected
             if isinstance(err, TimeoutError):
                 raise MeterTimeout(f"GET {path} timed out after {t.timeouts.response:.0f} s") from err
             raise
@@ -585,12 +626,16 @@ class Batch:
     async def close(self) -> None:
         if self._conn is not None:
             conn, self._conn = self._conn, None
-            await conn.close()
+            try:
+                await conn.close()
+            finally:
+                _shared(self._t.host, self._t.port).last_close = time.monotonic()
 
     def _kill(self) -> None:
         if self._conn is not None:
             conn, self._conn = self._conn, None
             conn.abort()
+            _shared(self._t.host, self._t.port).last_close = time.monotonic()
 
 
 # Reconnect instead of reusing a connection idle this long (the meter closes

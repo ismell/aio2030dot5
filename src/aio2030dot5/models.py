@@ -42,8 +42,11 @@ class FlowDirection(enum.IntEnum):
 
     NOT_APPLICABLE = 0
     DELIVERED = 1  # utility -> customer (import)
-    NET = 4  # delivered minus received
     RECEIVED = 19  # customer -> utility (export)
+    # Not in sep.xsd ("all other values reserved"), but IEC 61968-9 values
+    # that Itron agents use.
+    NET = 4  # delivered minus received
+    TOTAL = 20  # delivered plus received
 
     @classmethod
     def _missing_(cls, value: object) -> FlowDirection:
@@ -193,10 +196,15 @@ class ListPage:
 
     all: int
     results: int
+    poll_rate: int | None = None  # only on lists of pollable resources
 
     @classmethod
     def of(cls, elem: ET.Element) -> ListPage:
-        return cls(all=int_attr(elem, "all"), results=int_attr(elem, "results"))
+        return cls(
+            all=int_attr(elem, "all"),
+            results=int_attr(elem, "results"),
+            poll_rate=int_attr(elem, "pollRate") if elem.get("pollRate") else None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,12 +284,25 @@ class DeviceInformation:
         )
 
 
+class RoleFlags(enum.IntFlag):
+    """UsagePoint roleFlags (HexBinary16)."""
+
+    IS_MIRROR = 0x01
+    IS_PREMISES_AGGREGATION_POINT = 0x02
+    IS_PEV = 0x04
+    IS_DER = 0x08
+    IS_REVENUE_QUALITY = 0x10
+    IS_DC = 0x20
+    IS_SUBMETER = 0x40
+
+
 @dataclass(frozen=True, slots=True)
 class UsagePoint:
     href: str
     description: str | None
     service_category: int | None
     status: int | None
+    role_flags: RoleFlags
     meter_reading_list_href: str | None
 
     @classmethod
@@ -292,6 +313,7 @@ class UsagePoint:
             description=text(elem, "description"),
             service_category=int_or_none(elem, "serviceCategoryKind"),
             status=int_or_none(elem, "status"),
+            role_flags=RoleFlags(hex_or_none(text(elem, "roleFlags"), "roleFlags") or 0),
             meter_reading_list_href=link(elem, "MeterReadingListLink"),
         )
 
@@ -320,72 +342,81 @@ class MeterReadingInfo:
         )
 
 
+class QualityFlags(enum.IntFlag):
+    """Reading qualityFlags (HexBinary16 bitmap, IEEE 2030.5). "00" = none set."""
+
+    VALID = 0x01
+    MANUALLY_EDITED = 0x02
+    ESTIMATED_REFERENCE_DAY = 0x04
+    ESTIMATED_LINEAR = 0x08
+    QUESTIONABLE = 0x10
+    DERIVED = 0x20
+    PROJECTED = 0x40
+
+    @property
+    def is_estimated(self) -> bool:
+        return bool(self & (QualityFlags.ESTIMATED_REFERENCE_DAY | QualityFlags.ESTIMATED_LINEAR))
+
+
 @dataclass(frozen=True, slots=True)
 class ReadingType:
-    kind: Kind
-    uom: Uom
-    raw_uom: int | None
-    flow_direction: FlowDirection
-    accumulation: Accumulation
-    data_qualifier: DataQualifier
+    """A ReadingType with its codes kept as the meter sent them.
+
+    The codes are plain ints, not enums, so a value this library does not
+    know survives parsing and caching unchanged; compare them with the enum
+    members (``rt.uom == Uom.WATT``), which are ints.
+    """
+
+    kind: int
+    uom: int
+    flow_direction: int
+    accumulation: int
+    data_qualifier: int
     power_of_ten_multiplier: int
     tou_tiers: int
     interval_length: int | None
     phase: int
 
+    _FIELDS = (
+        ("kind", "kind"),
+        ("uom", "uom"),
+        ("flow_direction", "flowDirection"),
+        ("accumulation", "accumulationBehaviour"),
+        ("data_qualifier", "dataQualifier"),
+        ("power_of_ten_multiplier", "powerOfTenMultiplier"),
+        ("tou_tiers", "numberOfTouTiers"),
+        ("phase", "phase"),
+    )
+
     @classmethod
     def from_xml(cls, root: ET.Element) -> ReadingType:
         expect_root(root, "ReadingType")
-        raw_uom = int_or_none(root, "uom")
-        return cls(
-            kind=Kind(int_or_none(root, "kind") or 0),
-            uom=Uom(raw_uom or 0),
-            raw_uom=raw_uom,
-            flow_direction=FlowDirection(int_or_none(root, "flowDirection") or 0),
-            accumulation=Accumulation(int_or_none(root, "accumulationBehaviour") or 0),
-            data_qualifier=DataQualifier(int_or_none(root, "dataQualifier") or 0),
-            power_of_ten_multiplier=int_or_none(root, "powerOfTenMultiplier") or 0,
-            tou_tiers=int_or_none(root, "numberOfTouTiers") or 0,
-            interval_length=int_or_none(root, "intervalLength"),
-            phase=int_or_none(root, "phase") or 0,
-        )
+        values: dict[str, int | None] = {attr: int_or_none(root, tag) or 0 for attr, tag in cls._FIELDS}
+        values["interval_length"] = int_or_none(root, "intervalLength")
+        return cls(**values)  # type: ignore[arg-type]
 
     @property
     def unit(self) -> str:
-        return UNIT_SYMBOLS.get(self.uom, "")
+        return UNIT_SYMBOLS.get(Uom(self.uom), "")
 
     def scale(self, raw: int | None) -> float | None:
+        """Apply powerOfTenMultiplier exactly (918 x 10^-3 is 0.918, not
+        0.9180000000000001)."""
         if raw is None:
             return None
-        return raw * (10.0**self.power_of_ten_multiplier)
+        p = self.power_of_ten_multiplier
+        return float(raw * 10**p) if p >= 0 else raw / 10 ** (-p)
 
     def to_dict(self) -> dict[str, int | None]:
-        return {
-            "kind": int(self.kind),
-            "uom": self.raw_uom,
-            "flowDirection": int(self.flow_direction),
-            "accumulationBehaviour": int(self.accumulation),
-            "dataQualifier": int(self.data_qualifier),
-            "powerOfTenMultiplier": self.power_of_ten_multiplier,
-            "numberOfTouTiers": self.tou_tiers,
-            "intervalLength": self.interval_length,
-            "phase": self.phase,
-        }
+        d: dict[str, int | None] = {tag: getattr(self, attr) for attr, tag in self._FIELDS}
+        d["intervalLength"] = self.interval_length
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, int | None]) -> ReadingType:
-        return cls(
-            kind=Kind(d.get("kind") or 0),
-            uom=Uom(d.get("uom") or 0),
-            raw_uom=d.get("uom"),
-            flow_direction=FlowDirection(d.get("flowDirection") or 0),
-            accumulation=Accumulation(d.get("accumulationBehaviour") or 0),
-            data_qualifier=DataQualifier(d.get("dataQualifier") or 0),
-            power_of_ten_multiplier=d.get("powerOfTenMultiplier") or 0,
-            tou_tiers=d.get("numberOfTouTiers") or 0,
-            interval_length=d.get("intervalLength"),
-            phase=d.get("phase") or 0,
-        )
+        values: dict[str, int | None] = {attr: int(d.get(tag) or 0) for attr, tag in cls._FIELDS}
+        values["interval_length"] = d.get("intervalLength")
+        return cls(**values)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,7 +428,7 @@ class Reading:
     start: datetime | None
     duration: int | None
     tou_tier: int | None
-    quality_flags: str | None
+    quality: QualityFlags | None
     local_id: int | None
 
     @classmethod
@@ -408,16 +439,16 @@ class Reading:
         if period is not None:
             start = int_or_none(period, "start")
             duration = int_or_none(period, "duration")
-        local_id = text(elem, "localID")
+        quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags")
         return cls(
             href=elem.get("href"),
             raw_value=int_or_none(elem, "value"),
             start=epoch(start),
             duration=duration,
             tou_tier=int_or_none(elem, "touTier"),
-            quality_flags=text(elem, "qualityFlags"),
+            quality=QualityFlags(quality) if quality is not None else None,
             # localID is hexBinary in the schema ("2F" for slot 47).
-            local_id=hex_or_none(local_id, "localID"),
+            local_id=hex_or_none(text(elem, "localID"), "localID"),
         )
 
 
@@ -428,7 +459,7 @@ class ReadingSetInfo:
     start: datetime | None
     duration: int | None
     reading_list_href: str | None
-    reading_count: int | None
+    reading_count: int | None  # unreliable on Kitu-based agents until the list is fetched once
 
     @classmethod
     def from_xml(cls, elem: ET.Element) -> ReadingSetInfo:
@@ -461,6 +492,8 @@ class Measurement:
     start: datetime | None
     duration: int | None
     tou_tier: int | None = None
+    uom: int = 0
+    quality: QualityFlags | None = None
 
     @classmethod
     def of(cls, reading: Reading, reading_type: ReadingType) -> Measurement:
@@ -470,6 +503,8 @@ class Measurement:
             start=reading.start,
             duration=reading.duration,
             tou_tier=reading.tou_tier,
+            uom=reading_type.uom,
+            quality=reading.quality,
         )
 
 
@@ -481,6 +516,8 @@ class IntervalValue:
     end: datetime
     value: float | None
     unit: str
+    uom: int = 0
+    quality: QualityFlags | None = None
 
 
 def interval_values(
@@ -488,8 +525,10 @@ def interval_values(
 ) -> list[IntervalValue]:
     """Expand a ReadingSet's readings into timestamped intervals.
 
-    Interval Readings carry no timePeriod of their own; slot N (localID) starts
-    at set.start + N * intervalLength.
+    A Reading's own timePeriod start wins when present. Otherwise -- the
+    Itron case, where interval Readings carry no timePeriod -- slot N
+    (localID, hexBinary) starts at set.start + N * intervalLength; gaps in
+    localID are missing intervals (outages).
     """
     if reading_set.start is None:
         raise MeterProtocolError(f"{reading_set.href} has no timePeriod start")
@@ -498,15 +537,20 @@ def interval_values(
         raise MeterProtocolError("interval ReadingType has no intervalLength")
     out = []
     for r in readings:
-        if r.local_id is None:
+        if r.start is not None:
+            start = r.start
+        elif r.local_id is not None:
+            start = reading_set.start + timedelta(seconds=r.local_id * length)
+        else:
             continue
-        start = reading_set.start + timedelta(seconds=r.local_id * length)
         out.append(
             IntervalValue(
                 start=start,
-                end=start + timedelta(seconds=length),
+                end=start + timedelta(seconds=r.duration or length),
                 value=reading_type.scale(r.raw_value),
                 unit=reading_type.unit,
+                uom=reading_type.uom,
+                quality=r.quality,
             )
         )
     out.sort(key=lambda v: v.start)

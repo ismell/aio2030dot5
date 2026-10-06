@@ -8,12 +8,13 @@ cadence and decide what to do with each exception class.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import ssl
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from .exceptions import MeterProtocolError
+from .exceptions import MeterNotFound, MeterProtocolError
 from .models import (
     DeviceInformation,
     IntervalValue,
@@ -24,7 +25,7 @@ from .models import (
     interval_values,
     parse_xml,
 )
-from .profile import Channel, MeterProfile, Statistic, discover, get_list
+from .profile import Channel, MeterProfile, Statistic, discover, get_list, resolve_href
 from .transport import Batch, MeterTransport, Timeouts, TransportStats, build_ssl_context
 
 
@@ -105,8 +106,9 @@ class Meter:
         values: dict[str, Measurement] = {}
         tou: dict[str, dict[int, Measurement]] = {}
         meter_time = None
-        fetched_at = datetime.now(UTC)
         async with self.transport.batch() as b:
+            # Taken once the lock is ours, not while queued behind another batch.
+            fetched_at = datetime.now(UTC)
             for ch in channels:
                 if ch.statistic == Statistic.TOU_SUMMATION and ch.tou_reading_list_href:
                     tou[ch.key] = await _read_tou(b, ch)
@@ -118,30 +120,62 @@ class Meter:
                 fetched_at = datetime.now(UTC)
         return MeterSnapshot(fetched_at=fetched_at, values=values, tou=tou, meter_time=meter_time)
 
-    async def read_latest_intervals(self, channel: Channel, *, complete_only: bool = True) -> list[IntervalValue]:
-        """Intervals in the newest ReadingSet of an interval channel (oldest first)."""
-        if channel.statistic != Statistic.INTERVAL or not channel.reading_set_list_href:
-            raise ValueError(f"{channel.key} is not an interval channel")
+    # -- interval data -----------------------------------------------------------
+    #
+    # An Itron agent keeps 60 ReadingSets of 12 h (UTC-aligned, newest first),
+    # each holding up to 48 15-min Readings. The newest set is partial: its
+    # duration grows and only completed intervals are listed.
+
+    async def read_latest_intervals(
+        self, channel: Channel, *, sets: int = 2, complete_only: bool = True
+    ) -> list[IntervalValue]:
+        """Completed intervals from the newest ``sets`` ReadingSets (oldest
+        first). Two sets, so the last interval before a set boundary
+        (11:45-12:00, 23:45-00:00 UTC) is not lost while the new set is empty."""
+        _require_interval(channel)
         async with self.transport.batch() as b:
-            newest = await _newest_set(b, channel.reading_set_list_href)
-            if newest is None:
-                return []
-            return await _read_set(b, channel, newest, complete_only)
+            newest = await _newest_sets(b, channel.reading_set_list_href, sets, self.host, self.port)
+            return await _read_sets(b, channel, newest, complete_only, self.host, self.port)
+
+    async def list_interval_sets(self, channel: Channel) -> list[ReadingSetInfo]:
+        """Every stored ReadingSet of an interval channel, newest first."""
+        href = _require_interval(channel)
+        async with self.transport.batch() as b:
+            _, elems = await get_list(b, href, "ReadingSet")
+        sets = [_resolve_set(href, ReadingSetInfo.from_xml(e), self.host, self.port) for e in elems]
+        return sorted(sets, key=_start, reverse=True)
+
+    async def read_interval_sets(
+        self, channel: Channel, sets: Iterable[ReadingSetInfo], *, complete_only: bool = True
+    ) -> list[IntervalValue]:
+        """The intervals of the given sets (from :meth:`list_interval_sets`),
+        oldest first, in one batch. Chunk long histories into several calls so
+        other readers get the meter in between. A set that rolled off the
+        meter meanwhile is skipped."""
+        _require_interval(channel)
+        async with self.transport.batch() as b:
+            return await _read_sets(b, channel, list(sets), complete_only, self.host, self.port)
+
+    async def read_intervals_since(
+        self, channel: Channel, since: datetime, *, complete_only: bool = True
+    ) -> list[IntervalValue]:
+        """Completed intervals ending after ``since`` (oldest first)."""
+        wanted = [
+            rs
+            for rs in await self.list_interval_sets(channel)
+            if rs.start is not None and rs.start + timedelta(seconds=rs.duration or 0) > since
+        ]
+        values = await self.read_interval_sets(channel, wanted, complete_only=complete_only)
+        return [v for v in values if v.end > since]
 
     async def read_interval_history(
         self, channel: Channel, *, max_sets: int | None = None, complete_only: bool = True
     ) -> list[IntervalValue]:
-        """Every stored interval (oldest first). Expensive: ~2 GETs per 12 h set
-        on an Itron agent (60 sets = 30 days); use sparingly, e.g. for backfill."""
-        if channel.statistic != Statistic.INTERVAL or not channel.reading_set_list_href:
-            raise ValueError(f"{channel.key} is not an interval channel")
-        out: list[IntervalValue] = []
-        async with self.transport.batch() as b:
-            _, sets = await get_list(b, channel.reading_set_list_href, "ReadingSet", limit=max_sets)
-            for elem in sets:
-                out.extend(await _read_set(b, channel, ReadingSetInfo.from_xml(elem), complete_only))
-        out.sort(key=lambda v: v.start)
-        return out
+        """Every stored interval (oldest first), or the newest ``max_sets``
+        sets. Expensive (~2 GETs per set, 60 sets on an Itron agent) and holds
+        the meter for the whole walk; prefer list/read_interval_sets in chunks."""
+        sets = await self.list_interval_sets(channel)
+        return await self.read_interval_sets(channel, sets[:max_sets], complete_only=complete_only)
 
     async def device_information(self, profile: MeterProfile) -> DeviceInformation | None:
         if not profile.device_information_href:
@@ -156,6 +190,13 @@ class Meter:
             return MeterTime.from_xml(parse_xml(await b.get(profile.time_href)))
 
 
+def _require_interval(channel: Channel) -> str:
+    """The channel's ReadingSetList href; ValueError if it is not interval data."""
+    if channel.statistic != Statistic.INTERVAL or not channel.reading_set_list_href:
+        raise ValueError(f"{channel.key} is not an interval channel")
+    return channel.reading_set_list_href
+
+
 async def _read_tou(b: Batch, ch: Channel) -> dict[int, Measurement]:
     assert ch.tou_reading_list_href
     _, elems = await get_list(b, ch.tou_reading_list_href, "Reading")
@@ -167,32 +208,49 @@ async def _read_tou(b: Batch, ch: Channel) -> dict[int, Measurement]:
     return tiers
 
 
-async def _newest_set(b: Batch, href: str) -> ReadingSetInfo | None:
-    """The ReadingSet with the latest start, without assuming list order."""
-    page, elems = await get_list(b, href, "ReadingSet", limit=2)
-    sets = [ReadingSetInfo.from_xml(e) for e in elems]
-    if not sets:
-        return None
-    if len(sets) == 2 and _start(sets[0]) < _start(sets[1]) and page.all > 2:
-        # Ascending order: the newest set is the last one.
-        _, last = await get_list(b, href, "ReadingSet", start=page.all - 1, limit=1)
-        sets.extend(ReadingSetInfo.from_xml(e) for e in last)
-    return max(sets, key=_start)
+def _resolve_set(base: str, rs: ReadingSetInfo, host: str, port: int) -> ReadingSetInfo:
+    href = resolve_href(base, rs.href, host, port) if rs.href else base
+    return dataclasses.replace(
+        rs,
+        href=href,
+        reading_list_href=resolve_href(href, rs.reading_list_href, host, port) if rs.reading_list_href else None,
+    )
+
+
+async def _newest_sets(b: Batch, href: str | None, count: int, host: str, port: int) -> list[ReadingSetInfo]:
+    """The ``count`` ReadingSets with the latest starts, without assuming list order."""
+    assert href
+    page, elems = await get_list(b, href, "ReadingSet", limit=max(count, 2))
+    sets = [_resolve_set(href, ReadingSetInfo.from_xml(e), host, port) for e in elems]
+    if len(sets) >= 2 and _start(sets[0]) < _start(sets[1]) and page.all > len(sets):
+        # Ascending order (the spec asks for newest first): read the tail instead.
+        _, tail = await get_list(b, href, "ReadingSet", start=max(page.all - count, 0), limit=count)
+        sets.extend(_resolve_set(href, ReadingSetInfo.from_xml(e), host, port) for e in tail)
+    return sorted(sets, key=_start, reverse=True)[:count]
 
 
 def _start(s: ReadingSetInfo) -> datetime:
     return s.start or datetime.min.replace(tzinfo=UTC)
 
 
-async def _read_set(b: Batch, ch: Channel, rs: ReadingSetInfo, complete_only: bool) -> list[IntervalValue]:
-    if not rs.reading_list_href:
-        return []
-    _, elems = await get_list(b, rs.reading_list_href, "Reading")
-    values = interval_values(rs, [Reading.from_xml(e) for e in elems], ch.reading_type)
-    if complete_only and rs.start is not None and rs.duration is not None:
-        horizon = rs.start + timedelta(seconds=rs.duration)
-        values = [v for v in values if v.end <= horizon]
-    return values
+async def _read_sets(
+    b: Batch, ch: Channel, sets: list[ReadingSetInfo], complete_only: bool, host: str, port: int
+) -> list[IntervalValue]:
+    out: list[IntervalValue] = []
+    for rs in sets:
+        if not rs.reading_list_href:
+            continue
+        try:
+            _, elems = await get_list(b, rs.reading_list_href, "Reading")
+        except MeterNotFound:
+            continue  # the set rolled off the meter since it was listed
+        values = interval_values(rs, [Reading.from_xml(e) for e in elems], ch.reading_type)
+        if complete_only and rs.start is not None and rs.duration is not None:
+            horizon = rs.start + timedelta(seconds=rs.duration)
+            values = [v for v in values if v.end <= horizon]
+        out.extend(values)
+    out.sort(key=lambda v: v.start)
+    return out
 
 
 __all__ = ["Meter", "MeterSnapshot"]

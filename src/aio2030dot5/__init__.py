@@ -7,15 +7,17 @@ deploys with local "Launchpad" access, but nothing here is Xcel-specific.
 from .client import Meter, MeterSnapshot
 from .exceptions import (
     MeterAuthError,
+    MeterBusy,
     MeterConnectionError,
     MeterError,
     MeterHttpError,
     MeterNotFound,
     MeterProtocolError,
     MeterTimeout,
+    ProfileError,
 )
 from .identity import lfdi_from_der, lfdi_from_pem, sfdi_from_lfdi
-from .models import IntervalValue, Measurement, MeterTime, ReadingType
+from .models import IntervalValue, Measurement, MeterTime, QualityFlags, ReadingSetInfo, ReadingType, Uom
 from .profile import Channel, Direction, MeterProfile, Quantity, Statistic
 from .transport import Timeouts, TransportStats, build_ssl_context
 
@@ -28,6 +30,7 @@ __all__ = [
     "Measurement",
     "Meter",
     "MeterAuthError",
+    "MeterBusy",
     "MeterConnectionError",
     "MeterError",
     "MeterHttpError",
@@ -37,11 +40,15 @@ __all__ = [
     "MeterSnapshot",
     "MeterTime",
     "MeterTimeout",
+    "ProfileError",
+    "QualityFlags",
     "Quantity",
+    "ReadingSetInfo",
     "ReadingType",
     "Statistic",
     "Timeouts",
     "TransportStats",
+    "Uom",
     "build_ssl_context",
     "lfdi_from_der",
     "lfdi_from_pem",
