@@ -242,6 +242,12 @@ class Channel:
         )
 
 
+def _optional_str(value: Any) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"expected a string, got {value!r}")
+    return value or None
+
+
 @dataclass(frozen=True, slots=True)
 class MeterProfile:
     """Everything discovery learned. Cache it with :meth:`to_dict` to skip
@@ -261,6 +267,10 @@ class MeterProfile:
     # LFDI of the TLS certificate seen during discovery: the identity to pin
     # (Meter(expected_lfdi=)). Equal to meter_lfdi on a conforming agent.
     certificate_lfdi: str | None = None
+    # DeviceInformation; None where the meter leaves it empty (Itron does).
+    model: str | None = None
+    serial_number: str | None = None
+    hardware_version: str | None = None
 
     def find(
         self,
@@ -302,6 +312,9 @@ class MeterProfile:
             "poll_rate": self.poll_rate,
             "device_information_href": self.device_information_href,
             "certificate_lfdi": self.certificate_lfdi,
+            "model": self.model,
+            "serial_number": self.serial_number,
+            "hardware_version": self.hardware_version,
             "channels": [c.to_dict() for c in self.channels],
         }
 
@@ -328,6 +341,9 @@ class MeterProfile:
                 channels=tuple(Channel.from_dict(c) for c in d["channels"]),
                 device_information_href=d.get("device_information_href"),
                 certificate_lfdi=d.get("certificate_lfdi"),
+                model=_optional_str(d.get("model")),
+                serial_number=_optional_str(d.get("serial_number")),
+                hardware_version=_optional_str(d.get("hardware_version")),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as err:
             raise ProfileError(f"malformed profile: {err!r}") from err
@@ -611,6 +627,9 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
         poll_rate=page.poll_rate or DEFAULT_POLL_RATE,
         channels=tuple(channels),
         device_information_href=info_href,
+        model=meter.model,
+        serial_number=meter.serial_number,
+        hardware_version=meter.hardware_version,
     )
 
 

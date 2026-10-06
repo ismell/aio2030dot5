@@ -56,7 +56,7 @@ from .transport import (
     build_ssl_context_from_pem,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "REDACT_KEYS",

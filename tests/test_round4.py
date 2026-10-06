@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 
 import pytest
 
-from aio2030dot5 import ReadingGuard, format_lfdi, manufacturer_name
+from aio2030dot5 import MeterProfile, ProfileError, ReadingGuard, format_lfdi, manufacturer_name
 
 from .conftest import Pki, make_meter
-from .meter_server import FakeMeter
+from .meter_server import FakeMeter, FixtureTree
 from .test_robustness import SlowTree
 
 HOUR = 3600.0
@@ -129,3 +131,36 @@ def test_lfdi_as_portals_show_it() -> None:
 def test_manufacturers() -> None:
     assert manufacturer_name(1233) == "Itron"
     assert manufacturer_name(4) is None and manufacturer_name(None) is None
+
+
+# -- device information ---------------------------------------------------------------
+
+
+class DescribedTree(FixtureTree):
+    """A meter that fills in its DeviceInformation (Itron's is empty)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        status, body = self.exact["/sdev/sdi"]
+        for tag, value in (("mfModel", "Model X"), ("mfSerNum", "SN-1"), ("mfHwVer", "HW 2")):
+            body = re.sub(rf"<{tag}>[^<]*</{tag}>", f"<{tag}>{value}</{tag}>", body)
+        self.exact["/sdev/sdi"] = (status, body)
+
+
+async def test_the_profile_keeps_what_the_meter_says_it_is(pki: Pki) -> None:
+    with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=DescribedTree()) as fm:
+        profile = await make_meter(pki, fm.port).discover()
+    assert (profile.model, profile.serial_number, profile.hardware_version) == ("Model X", "SN-1", "HW 2")
+    assert MeterProfile.from_dict(json.loads(json.dumps(profile.to_dict()))) == profile
+
+    older = profile.to_dict()  # cached before these fields existed
+    for key in ("model", "serial_number", "hardware_version"):
+        del older[key]
+    assert MeterProfile.from_dict(older).model is None
+    with pytest.raises(ProfileError):
+        MeterProfile.from_dict({**profile.to_dict(), "model": 5})
+
+
+async def test_an_empty_device_information_is_none(pki: Pki, fake_meter: FakeMeter) -> None:
+    profile = await make_meter(pki, fake_meter.port).discover()
+    assert (profile.model, profile.serial_number, profile.hardware_version) == (None, None, None)
