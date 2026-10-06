@@ -252,6 +252,9 @@ class MeterProfile:
     poll_rate: int
     channels: tuple[Channel, ...] = field(default_factory=tuple)
     device_information_href: str | None = None
+    # LFDI of the TLS certificate seen during discovery: the identity to pin
+    # (Meter(expected_lfdi=)). Equal to meter_lfdi on a conforming agent.
+    certificate_lfdi: str | None = None
 
     def find(
         self,
@@ -292,6 +295,7 @@ class MeterProfile:
             "usage_point_href": self.usage_point_href,
             "poll_rate": self.poll_rate,
             "device_information_href": self.device_information_href,
+            "certificate_lfdi": self.certificate_lfdi,
             "channels": [c.to_dict() for c in self.channels],
         }
 
@@ -314,6 +318,7 @@ class MeterProfile:
                 poll_rate=int(d.get("poll_rate") or DEFAULT_POLL_RATE),
                 channels=tuple(Channel.from_dict(c) for c in d["channels"]),
                 device_information_href=d.get("device_information_href"),
+                certificate_lfdi=d.get("certificate_lfdi"),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as err:
             raise ProfileError(f"malformed profile: {err!r}") from err

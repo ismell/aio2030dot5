@@ -45,6 +45,16 @@ This library is designed around that:
     another scheme raises `ProfileError`.
   - Two readings that classify identically are numbered `_2`, `_3` in mRID order and flagged `ambiguous`.
 
+- **Identified by certificate, not address.** In IEEE 2030.5 a device's LFDI is the SHA-256 of its certificate.
+  - Every connection checks the meter's certificate against `expected_lfdi` before sending a request. Another device
+    at the address raises `MeterIdentityMismatch`, e.g. after a DHCP change.
+  - `discover()` pins the meter it finds, and a cached profile carries the pin.
+  - `probe_tls()` reads the meter's identity even before our certificate is registered: the meter sends its
+    certificate in the clear before it refuses ours.
+- **Found by mDNS.** Meters advertise `_smartenergy._tcp` with their SFDI in the instance name.
+  - `parse_advertisement()` reads an advertisement that a zeroconf library resolved.
+  - With the `zeroconf` extra, `aio2030dot5.locate.async_locate(aiozc, sfdi)` finds the meter's current address.
+
 ## Usage
 
 ```python
@@ -60,6 +70,17 @@ snap.tou["energy_tou_summation_delivered"]  # {tier: Measurement}; tier 0 is the
 
 ch = profile.find(Quantity.ENERGY, Statistic.INTERVAL, Direction.DELIVERED)
 await meter.read_latest_intervals(ch)       # completed 15-minute intervals of the newest set
+```
+
+Without a fixed address (the `zeroconf` extra):
+
+```python
+from zeroconf.asyncio import AsyncZeroconf
+from aio2030dot5.locate import async_locate
+
+adv = await async_locate(AsyncZeroconf(), "123456789014")   # the meter's SFDI
+meter = Meter(adv.host, ctx, adv.port, expected_lfdi=lfdi)  # the connection proves it is that meter
+profile = await meter.discover(dcap_path=adv.dcap_path)
 ```
 
 From the command line:
@@ -86,5 +107,5 @@ anonymised), served by a fake meter that speaks the same TLS profile and models 
 paging and session resumption.
 
 ```
-pip install -e '.[identity]' pytest pytest-asyncio && pytest
+pip install -e '.[identity,zeroconf]' pytest pytest-asyncio && pytest
 ```

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import ssl
 import time
 import weakref
@@ -33,10 +34,12 @@ from .exceptions import (
     MeterBusy,
     MeterConnectionError,
     MeterHttpError,
+    MeterIdentityMismatch,
     MeterNotFound,
     MeterProtocolError,
     MeterTimeout,
 )
+from .identity import lfdi_from_der, sfdi_from_lfdi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,10 +54,12 @@ def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
     """TLS client context for an IEEE 2030.5 HAN meter.
 
     Blocking (reads the cert and key files): call it from an executor in an
-    event loop. The meter's server certificate is self-signed by the meter and
-    cannot be verified, so verification is disabled -- on this context only.
-    Trust runs the other way: the meter admits us because our certificate's
-    LFDI is registered with the utility.
+    event loop. The meter's certificate chains to its manufacturer's 2030.5
+    root (on an Itron, "IEEE 2030.5 Root, O=Itron"), which is in no trust
+    store, so CA verification is disabled -- on this context only. The meter
+    is authenticated by pinning its LFDI instead (``Meter(expected_lfdi=)``,
+    set by ``discover()``); it admits us because our certificate's LFDI is
+    registered with the utility.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -107,6 +112,93 @@ class Response:
     keep_alive: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PeerCertificate:
+    """The certificate a meter presented, and the identity it implies.
+
+    In IEEE 2030.5 a device's LFDI *is* the SHA-256 of its device certificate,
+    so this identifies the meter whatever its address: on an Itron Gen5 Riva it
+    equals the ``/sdev`` lFDI, and the SFDI is the one in its mDNS instance
+    name. It is not verified against a CA -- pin it (trust on first use).
+    """
+
+    der: bytes  # the leaf (device) certificate
+    chain: tuple[bytes, ...]  # as sent, leaf first; just the leaf on a resumed session
+    lfdi: str
+    sfdi: str
+
+    @classmethod
+    def from_chain(cls, chain: tuple[bytes, ...]) -> PeerCertificate:
+        lfdi = lfdi_from_der(chain[0])
+        return cls(der=chain[0], chain=chain, lfdi=lfdi, sfdi=sfdi_from_lfdi(lfdi))
+
+
+class _CertificateTap:
+    """Picks the server's Certificate message out of the raw TLS 1.2 stream.
+
+    The meter sends its certificate in the clear before it judges ours, and
+    rejects an unregistered client with an alert that makes OpenSSL discard
+    everything it learned. Reading the handshake bytes ourselves is the only
+    way to learn who refused us -- which is what a setup flow needs before the
+    client certificate is registered, and what tells "wrong device at this
+    address" apart from "not registered". Best effort: anything unexpected
+    just stops the tap.
+    """
+
+    _LIMIT = 65536
+
+    def __init__(self) -> None:
+        self._records = b""
+        self._handshake = b""
+        self._seen = 0
+        self.chain: tuple[bytes, ...] | None = None
+        self.done = False
+
+    def feed(self, data: bytes) -> None:
+        if self.done:
+            return
+        self._seen += len(data)
+        if self._seen > self._LIMIT:
+            self.done = True
+            return
+        self._records += data
+        while len(self._records) >= 5 and not self.done:
+            content_type, length = self._records[0], int.from_bytes(self._records[3:5], "big")
+            if len(self._records) < 5 + length:
+                return
+            body, self._records = self._records[5 : 5 + length], self._records[5 + length :]
+            if content_type == 22:  # handshake
+                self._handshake += body
+                self._messages()
+            elif content_type != 21:  # anything but an alert: ChangeCipherSpec onwards is encrypted
+                self.done = True
+
+    def _messages(self) -> None:
+        while len(self._handshake) >= 4 and not self.done:
+            kind, length = self._handshake[0], int.from_bytes(self._handshake[1:4], "big")
+            if len(self._handshake) < 4 + length:
+                return
+            body, self._handshake = self._handshake[4 : 4 + length], self._handshake[4 + length :]
+            if kind == 11:  # Certificate
+                self.chain = _certificate_list(body)
+                self.done = True
+            elif kind == 14:  # ServerHelloDone: no certificate is coming
+                self.done = True
+
+
+def _certificate_list(body: bytes) -> tuple[bytes, ...] | None:
+    if len(body) < 3 or int.from_bytes(body[:3], "big") != len(body) - 3:
+        return None
+    certs, i = [], 3
+    while i + 3 <= len(body):
+        n = int.from_bytes(body[i : i + 3], "big")
+        if n == 0 or i + 3 + n > len(body):
+            return None
+        certs.append(body[i + 3 : i + 3 + n])
+        i += 3 + n
+    return tuple(certs) if certs and i == len(body) else None
+
+
 # -- TLS over MemoryBIO -------------------------------------------------------
 
 
@@ -120,12 +212,14 @@ class _TlsConnection:
         sslobj: ssl.SSLObject,
         incoming: ssl.MemoryBIO,
         outgoing: ssl.MemoryBIO,
+        tap: _CertificateTap | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
         self._ssl = sslobj
         self._in = incoming
         self._out = outgoing
+        self._tap = tap  # fed raw bytes until the handshake ends
         self._buffer = b""
         self.eof = False
         self.requests = 0
@@ -139,6 +233,7 @@ class _TlsConnection:
         ctx: ssl.SSLContext,
         session: ssl.SSLSession | None,
         timeouts: Timeouts,
+        tap: _CertificateTap | None = None,
     ) -> _TlsConnection:
         try:
             async with asyncio.timeout(timeouts.connect):
@@ -151,7 +246,7 @@ class _TlsConnection:
         try:
             incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
             sslobj = ctx.wrap_bio(incoming, outgoing, server_side=False, session=session)
-            conn = cls(reader, writer, sslobj, incoming, outgoing)
+            conn = cls(reader, writer, sslobj, incoming, outgoing, tap)
         except BaseException:
             writer.transport.abort()
             raise
@@ -170,6 +265,14 @@ class _TlsConnection:
     @property
     def session_reused(self) -> bool:
         return self._ssl.session_reused
+
+    def peer_chain(self) -> tuple[bytes, ...] | None:
+        """The meter's certificate chain, leaf first. A resumed session has
+        no Certificate message; OpenSSL keeps the leaf in the session."""
+        if self._tap is not None and self._tap.chain:
+            return self._tap.chain
+        der = self._ssl.getpeercert(binary_form=True)
+        return (der,) if der else None
 
     # _flush and _feed are the only places that touch the socket, so every
     # OSError (a reset from a meter that is clamping down, a broken pipe) is
@@ -193,6 +296,8 @@ class _TlsConnection:
         if not data:
             self._in.write_eof()
             return False
+        if self._tap is not None and not self._tap.done:
+            self._tap.feed(data)
         self._in.write(data)
         return True
 
@@ -246,9 +351,8 @@ class _TlsConnection:
                 self.eof = True
                 return b""
             except ssl.SSLError as err:
-                # An Itron meter completes the handshake with an unregistered
-                # certificate and sends bad_certificate ~0.5 s later, so an
-                # auth alert can arrive here, on the first read.
+                # Agents that let an unregistered client finish the handshake
+                # send their auth alert later, so it can arrive here.
                 raise _classify_ssl_error(err, handshake=False) from err
 
     async def read_response(self) -> Response:
@@ -468,10 +572,14 @@ class MeterTransport:
         timeouts: Timeouts | None = None,
         min_connect_interval: float = 2.0,
         request_spacing: float = 0.25,
+        expected_lfdi: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self._ctx = ssl_context
+        self.expected_lfdi = expected_lfdi
+        # The certificate from the latest handshake -- also a refused one.
+        self.peer: PeerCertificate | None = None
         self.timeouts = timeouts or Timeouts()
         self.min_connect_interval = min_connect_interval
         self.request_spacing = request_spacing
@@ -482,10 +590,23 @@ class MeterTransport:
     def _lock(self) -> asyncio.Lock:
         return _shared(self.host, self.port).lock
 
+    @property
+    def expected_lfdi(self) -> str | None:
+        """The meter's LFDI, checked on every connection before any request
+        is sent; a different device raises :class:`MeterIdentityMismatch`.
+        ``None`` checks nothing."""
+        return self._expected_lfdi
+
+    @expected_lfdi.setter
+    def expected_lfdi(self, lfdi: str | None) -> None:
+        if lfdi is not None and not re.fullmatch(r"[0-9A-Fa-f]{40}", lfdi):
+            raise ValueError(f"an LFDI is 40 hex digits, got {lfdi!r}")
+        self._expected_lfdi = lfdi.upper() if lfdi else None
+
     def forget_session(self) -> None:
         self._session = None
 
-    async def _connect(self) -> _TlsConnection:
+    async def _connect(self, *, verify: bool = True) -> _TlsConnection:
         shared = _shared(self.host, self.port)
         # Spaced from the last connect AND the last close: a long batch must
         # not be followed by a connect the instant it ends.
@@ -496,7 +617,7 @@ class MeterTransport:
         t0 = time.monotonic()
         try:
             try:
-                conn = await self._open_once()
+                conn = await self._open_once(verify)
             except _BadSignature:
                 # Meter-side signing glitch; observed ~1 in 190 handshakes, and
                 # an immediate second attempt has always succeeded.
@@ -506,7 +627,13 @@ class MeterTransport:
                 await asyncio.sleep(self.min_connect_interval)
                 shared.last_connect = time.monotonic()
                 t0 = time.monotonic()
-                conn = await self._open_once()
+                conn = await self._open_once(verify)
+            if verify:
+                try:
+                    self._check_identity()
+                except BaseException:
+                    conn.abort()
+                    raise
         except BaseException:
             # A failed attempt counts as a close for pacing: a slow handshake
             # that ends in a reset must not be followed by another at once.
@@ -519,13 +646,20 @@ class MeterTransport:
         self._session = conn.session
         return conn
 
-    async def _open_once(self) -> _TlsConnection:
+    async def _open_once(self, verify: bool) -> _TlsConnection:
+        tap = _CertificateTap()
+        self.peer = None
         try:
-            return await _TlsConnection.open(self.host, self.port, self._ctx, self._session, self.timeouts)
+            conn = await _TlsConnection.open(self.host, self.port, self._ctx, self._session, self.timeouts, tap)
         except TimeoutError as err:
             raise MeterTimeout(f"TLS handshake with {self.host}:{self.port} timed out") from err
         except MeterAuthError:
             self.forget_session()
+            self._record_peer(tap.chain)
+            if verify:
+                # A device that is not our meter would refuse our certificate
+                # too: report the real problem, the address.
+                self._check_identity()
             raise
         except MeterConnectionError as err:
             # Keep the session across plain network failures (refused, reset,
@@ -535,10 +669,27 @@ class MeterTransport:
             if isinstance(err.__cause__, ssl.SSLError):
                 self.forget_session()
             raise
+        self._record_peer(conn.peer_chain())
+        return conn
+
+    def _record_peer(self, chain: tuple[bytes, ...] | None) -> None:
+        self.peer = PeerCertificate.from_chain(chain) if chain else None
+
+    def _check_identity(self) -> None:
+        expected = self.expected_lfdi
+        if expected is None:
+            return
+        actual = self.peer.lfdi if self.peer else None
+        if actual != expected:
+            self.forget_session()
+            raise MeterIdentityMismatch(self.host, expected, actual)
 
     @asynccontextmanager
-    async def batch(self) -> AsyncIterator[Batch]:
+    async def batch(self, *, verify_identity: bool = True) -> AsyncIterator[Batch]:
         """One connection's worth of requests, holding the meter's lock.
+
+        ``verify_identity=False`` skips the :attr:`expected_lfdi` check (for
+        probing an address: read :attr:`peer` afterwards).
 
         Not re-entrant: starting a batch for the same meter (via this or any
         other Meter object) from inside one raises RuntimeError instead of
@@ -550,7 +701,7 @@ class MeterTransport:
             raise RuntimeError(f"nested batch on {self.host}:{self.port} would deadlock")
         async with shared.lock:
             shared.owner = task
-            b = Batch(self)
+            b = Batch(self, verify_identity)
             try:
                 yield b
             except Exception:
@@ -572,8 +723,9 @@ class MeterTransport:
 class Batch:
     """GETs on one connection. Created only by :meth:`MeterTransport.batch`."""
 
-    def __init__(self, transport: MeterTransport) -> None:
+    def __init__(self, transport: MeterTransport, verify_identity: bool = True) -> None:
         self._t = transport
+        self._verify = verify_identity
         self._conn: _TlsConnection | None = None
         self._last_request = -1e9
         self._busy = False
@@ -593,6 +745,22 @@ class Batch:
         if not 200 <= resp.status < 300:
             raise MeterHttpError(path, resp.status, resp.reason)
         return resp.body
+
+    async def connect(self) -> PeerCertificate | None:
+        """Open the batch's connection now (a no-op if one is open) and return
+        the meter's certificate. A handshake alone sends no request."""
+        if self._closed:
+            raise RuntimeError("Batch used after its batch() block exited")
+        if self._busy:
+            raise RuntimeError("Batch is not safe for concurrent use; await one request at a time")
+        if self._conn is None or self._conn.looks_dead():
+            await self.close()
+            self._busy = True
+            try:
+                self._conn = await self._t._connect(verify=self._verify)
+            finally:
+                self._busy = False
+        return self._t.peer
 
     async def request(self, path: str) -> Response:
         # A Batch owns one connection and must stay on one task: two requests
@@ -642,7 +810,7 @@ class Batch:
                 # left running by gather()): connecting now would be outside
                 # the lock, beside whatever holds it.
                 raise RuntimeError("Batch used after its batch() block exited")
-            self._conn = await t._connect()
+            self._conn = await t._connect(verify=self._verify)
         conn = self._conn
         host = _host_header(t.host, t.port)
         request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: {CONTENT_TYPE}\r\n\r\n".encode("ascii")

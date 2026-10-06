@@ -19,6 +19,7 @@ classifiers = [
 
 [project.optional-dependencies]
 identity = ["cryptography>=43"]
+zeroconf = ["zeroconf>=0.130"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aio2030dot5"]

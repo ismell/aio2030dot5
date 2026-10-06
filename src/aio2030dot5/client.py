@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import ssl
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from .exceptions import MeterNotFound, MeterProtocolError
+from .exceptions import MeterAuthError, MeterNotFound, MeterProtocolError, ProfileError
 from .models import (
     DeviceInformation,
     IntervalValue,
@@ -26,7 +27,9 @@ from .models import (
     parse_xml,
 )
 from .profile import Channel, MeterProfile, Statistic, discover, get_list, resolve_href
-from .transport import Batch, MeterTransport, Timeouts, TransportStats, build_ssl_context
+from .transport import Batch, MeterTransport, PeerCertificate, Timeouts, TransportStats, build_ssl_context
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,12 +50,28 @@ class MeterSnapshot:
         return self.meter_time.current_time - self.fetched_at
 
 
+@dataclass(frozen=True, slots=True)
+class PeerInfo:
+    """What :meth:`Meter.probe_tls` found at an address."""
+
+    certificate: PeerCertificate  # .lfdi / .sfdi identify the meter
+    client_accepted: bool  # the handshake completed with our certificate
+    auth_reason: str | None = None  # MeterAuthError.reason when it did not
+
+
 class Meter:
     """An IEEE 2030.5 meter reachable over the HAN (local) interface.
 
     Every public coroutine runs as one batch on one connection, and the
     instance never opens two connections at once. Share a single ``Meter``
     per physical meter.
+
+    The meter is identified by its LFDI, not its address: every connection
+    checks the meter's certificate against ``expected_lfdi`` before sending a
+    request, and raises :class:`MeterIdentityMismatch` if another device
+    answers (e.g. after a DHCP change -- find the meter again by mDNS). If
+    ``expected_lfdi`` is not given, :meth:`discover` pins the meter it finds,
+    and :meth:`read` pins the one a cached profile was discovered from.
     """
 
     def __init__(
@@ -64,6 +83,7 @@ class Meter:
         timeouts: Timeouts | None = None,
         min_connect_interval: float = 2.0,
         request_spacing: float = 0.25,
+        expected_lfdi: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -74,6 +94,7 @@ class Meter:
             timeouts=timeouts,
             min_connect_interval=min_connect_interval,
             request_spacing=request_spacing,
+            expected_lfdi=expected_lfdi,
         )
 
     @classmethod
@@ -86,12 +107,63 @@ class Meter:
     def stats(self) -> TransportStats:
         return self.transport.stats
 
+    @property
+    def expected_lfdi(self) -> str | None:
+        return self.transport.expected_lfdi
+
+    async def probe_tls(self) -> PeerInfo:
+        """Who is at this address, and does it take our certificate?
+
+        One handshake, then a clean close: no request, and no identity check
+        (compare ``certificate.lfdi`` yourself). Works before our certificate
+        is registered -- the meter sends its certificate before refusing ours.
+        Agents that refuse only after the handshake report ``client_accepted``
+        and fail on the first request instead.
+
+        Raises ``MeterConnectionError``/``MeterTimeout`` if nothing answers,
+        ``MeterProtocolError`` if the device sent no certificate.
+        """
+        try:
+            async with self.transport.batch(verify_identity=False) as b:
+                peer = await b.connect()
+        except MeterAuthError as err:
+            if self.transport.peer is None:
+                raise
+            return PeerInfo(self.transport.peer, client_accepted=False, auth_reason=err.reason)
+        if peer is None:
+            raise MeterProtocolError(f"{self.host}:{self.port} presented no certificate")
+        return PeerInfo(peer, client_accepted=True)
+
     async def discover(self, *, dcap_path: str = "/dcap") -> MeterProfile:
         """Walk the resource tree (~30 GETs, one connection). ``dcap_path``
         comes from the DNS-SD TXT record ``dcap`` when the meter was found by
-        mDNS."""
+        mDNS. Pins the meter (``expected_lfdi``) if nothing was pinned yet."""
         async with self.transport.batch() as b:
-            return await discover(b, self.host, self.port, dcap_path=dcap_path)
+            peer = await b.connect()
+            profile = await discover(b, self.host, self.port, dcap_path=dcap_path)
+        if peer is None:
+            return profile
+        if profile.meter_lfdi and profile.meter_lfdi.upper() != peer.lfdi:
+            _LOGGER.warning(
+                "%s: /sdev reports LFDI %s but its TLS certificate is %s; pinning the certificate",
+                self.host,
+                profile.meter_lfdi,
+                peer.lfdi,
+            )
+        if self.transport.expected_lfdi is None:
+            self.transport.expected_lfdi = peer.lfdi
+        return dataclasses.replace(profile, certificate_lfdi=peer.lfdi)
+
+    def _pin(self, profile: MeterProfile) -> None:
+        """Adopt a cached profile's meter identity, or refuse a profile from
+        another meter."""
+        pinned = profile.certificate_lfdi.upper() if profile.certificate_lfdi else None
+        if pinned is None:
+            return
+        if self.transport.expected_lfdi is None:
+            self.transport.expected_lfdi = pinned
+        elif self.transport.expected_lfdi != pinned:
+            raise ProfileError(f"profile is from meter {pinned}, but this Meter expects {self.transport.expected_lfdi}")
 
     async def read(
         self,
@@ -105,6 +177,7 @@ class Meter:
         Interval channels are skipped; use :meth:`read_latest_intervals`.
         Raises ``MeterNotFound`` if a profiled path vanished (rediscover).
         """
+        self._pin(profile)
         values: dict[str, Measurement] = {}
         tou: dict[str, dict[int, Measurement]] = {}
         meter_time = None
@@ -183,12 +256,14 @@ class Meter:
         return await self.read_interval_sets(channel, sets[:max_sets], complete_only=complete_only)
 
     async def device_information(self, profile: MeterProfile) -> DeviceInformation | None:
+        self._pin(profile)
         if not profile.device_information_href:
             return None
         async with self.transport.batch() as b:
             return DeviceInformation.from_xml(parse_xml(await b.get(profile.device_information_href)))
 
     async def meter_time(self, profile: MeterProfile) -> MeterTime:
+        self._pin(profile)
         if not profile.time_href:
             raise MeterProtocolError("meter advertises no TimeLink")
         async with self.transport.batch() as b:
@@ -260,4 +335,4 @@ async def _read_sets(
     return out
 
 
-__all__ = ["Meter", "MeterSnapshot"]
+__all__ = ["Meter", "MeterSnapshot", "PeerInfo"]

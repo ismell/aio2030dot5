@@ -20,6 +20,21 @@ class MeterBusy(MeterConnectionError):
     """The meter answered 429/503: it is overloaded. Back off like for an outage."""
 
 
+class MeterIdentityMismatch(MeterConnectionError):
+    """The device at this address is not the expected meter: its certificate's
+    LFDI differs (or it presented none). The meter moved -- e.g. a new DHCP
+    lease -- or another device took its address. Locate the meter again (by
+    mDNS, matching its SFDI) rather than retrying the same address. No request
+    was sent to the device.
+    """
+
+    def __init__(self, host: str, expected: str, actual: str | None) -> None:
+        super().__init__(f"{host} is not the expected meter: LFDI {actual or 'unknown'}, expected {expected}")
+        self.host = host
+        self.expected = expected
+        self.actual = actual
+
+
 class MeterAuthError(MeterError):
     """The meter rejected our client certificate.
 
@@ -28,9 +43,9 @@ class MeterAuthError(MeterError):
     not help. ``reason`` is one of:
 
     * ``"certificate_rejected"`` -- TLS ``bad_certificate``/``unknown_ca``/
-      ``certificate_unknown``. An Itron Gen5 Riva completes the handshake with
-      an unregistered certificate and sends ``bad_certificate`` ~0.5 s later,
-      so this can surface on the first request rather than the handshake.
+      ``certificate_unknown``. An Itron Gen5 Riva (agent 3.2.50) sends
+      ``bad_certificate`` in place of its Finished message; agents that send it
+      after the handshake make this surface on the first request instead.
     * ``"certificate_expired"``, ``"certificate_revoked"``, ``"access_denied"``
     * ``"http_401"``, ``"http_403"`` -- servers that authorise at the HTTP layer.
     """

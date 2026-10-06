@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from aio2030dot5.identity import lfdi_from_pem, sfdi_from_lfdi
+
 FIXTURES = Path(__file__).parent / "fixtures" / "itron_riva_3_2_50.json"
 NS = "urn:ieee:std:2030.5:ns"
 ET.register_namespace("", NS)
@@ -109,6 +111,8 @@ class FakeMeter:
         # evicts the session from the server cache and nothing can resume.
         self.clean_close = clean_close
         self.log = ServerLog()
+        self.lfdi = lfdi_from_pem(Path(server_cert).read_bytes())
+        self.sfdi = sfdi_from_lfdi(self.lfdi)
         self._active = 0
         self._lock = threading.Lock()
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -182,6 +186,8 @@ class FakeMeter:
                     return
                 self.log.requests.append(target)
                 status, body = self.tree.respond(target)
+                # Like a real meter, /sdev names the certificate it presented.
+                body = body.replace(self.tree.meta["lfdi"], self.lfdi).replace(self.tree.meta["sfdi"], self.sfdi)
                 served += 1
                 close = (not self.honour_keep_alive) or (self.max_requests is not None and served >= self.max_requests)
                 reason = {200: "OK", 404: "Not Found", 405: "Method Not Allowed"}.get(status, "Status")
