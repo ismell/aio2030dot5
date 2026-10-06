@@ -10,6 +10,7 @@ become ``None`` rather than errors, because real agents omit fields freely
 from __future__ import annotations
 
 import enum
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -178,13 +179,26 @@ def int_attr(elem: ET.Element, name: str, default: int = 0) -> int:
         raise MeterProtocolError(f"attribute {name}={raw!r} is not an integer") from err
 
 
+_HEX = re.compile(r"[0-9A-Fa-f]{1,16}")
+
+
 def hex_or_none(value: str | None, what: str) -> int | None:
+    """Strict hexBinary: digits only -- no sign, prefix or padding."""
     if value is None:
         return None
-    try:
-        return int(value, 16)
-    except ValueError as err:
-        raise MeterProtocolError(f"{what} {value!r} is not hexBinary") from err
+    if not _HEX.fullmatch(value):
+        raise MeterProtocolError(f"{what} {value!r} is not hexBinary")
+    return int(value, 16)
+
+
+INT48 = 2**47  # Reading values are Int48
+
+
+def int_in_range(elem: ET.Element, name: str, lo: int, hi: int) -> int | None:
+    value = int_or_none(elem, name)
+    if value is not None and not lo <= value < hi:
+        raise MeterProtocolError(f"<{name}> {value} out of range")
+    return value
 
 
 # -- resources ----------------------------------------------------------------
@@ -392,6 +406,7 @@ class ReadingType:
     def from_xml(cls, root: ET.Element) -> ReadingType:
         expect_root(root, "ReadingType")
         values: dict[str, int | None] = {attr: int_or_none(root, tag) or 0 for attr, tag in cls._FIELDS}
+        values["power_of_ten_multiplier"] = int_in_range(root, "powerOfTenMultiplier", -128, 128) or 0  # Int8
         values["interval_length"] = int_or_none(root, "intervalLength")
         return cls(**values)  # type: ignore[arg-type]
 
@@ -442,7 +457,7 @@ class Reading:
         quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags")
         return cls(
             href=elem.get("href"),
-            raw_value=int_or_none(elem, "value"),
+            raw_value=int_in_range(elem, "value", -INT48, INT48),
             start=epoch(start),
             duration=duration,
             tou_tier=int_or_none(elem, "touTier"),
@@ -535,6 +550,7 @@ def interval_values(
     length = reading_type.interval_length
     if not length:
         raise MeterProtocolError("interval ReadingType has no intervalLength")
+    set_end = reading_set.start + timedelta(seconds=reading_set.duration) if reading_set.duration else None
     out = []
     for r in readings:
         if r.start is not None:
@@ -542,6 +558,10 @@ def interval_values(
         elif r.local_id is not None:
             start = reading_set.start + timedelta(seconds=r.local_id * length)
         else:
+            continue
+        # A slot outside its own set (an agent numbering localID globally, a
+        # bad value) would land data at the wrong time: drop it.
+        if start < reading_set.start or (set_end is not None and start >= set_end):
             continue
         out.append(
             IntervalValue(

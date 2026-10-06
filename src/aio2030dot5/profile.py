@@ -14,6 +14,7 @@ derived from what a channel *is* -- quantity, statistic, direction, phase
 from __future__ import annotations
 
 import enum
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,7 +43,13 @@ from .models import (
 )
 from .transport import Batch
 
-PROFILE_VERSION = 2
+_LOGGER = logging.getLogger(__name__)
+
+PROFILE_VERSION = 3
+# Bump whenever classify() or the key format changes in a way that could
+# change an existing channel's key; cached profiles from another scheme are
+# rejected so the consumer rediscovers (and can map old keys to new ones).
+KEY_SCHEME = 1
 PAGE_SIZE = 25  # the Itron agent pages large lists itself; 25 is always accepted
 DEFAULT_POLL_RATE = 900  # IEEE 2030.5 default when a list omits pollRate
 
@@ -148,7 +155,20 @@ def classify(rt: ReadingType, description: str | None = None) -> tuple[Quantity,
                 statistic = Statistic.TOU_SUMMATION
             elif "summation" in words:
                 statistic = Statistic.SUMMATION
-        if "net" in words:
+        if statistic == Statistic.INSTANTANEOUS and quantity == Quantity.POWER:
+            # v1/v2 agents tag every demand dataQualifier 2 (average).
+            if words & {"max", "maximum"}:
+                statistic = Statistic.MAXIMUM
+            elif words & {"min", "minimum"}:
+                statistic = Statistic.MINIMUM
+        # "Net" only overrides a direction the ReadingType leaves vague
+        # (none, or delivered as older agents mislabel it), and only when the
+        # description names no other direction ("Net Metering Delivered").
+        if (
+            "net" in words
+            and direction in (Direction.NONE, Direction.DELIVERED)
+            and not words & {"delivered", "received"}
+        ):
             direction = Direction.NET
     return quantity, statistic, direction
 
@@ -172,10 +192,17 @@ class Channel:
     # the tiers that held a value at discovery (Itron: tier 0 is the total).
     tou_reading_list_href: str | None = None
     tou_tiers: tuple[int, ...] = ()
+    # Another channel classified identically, so this key carries a _N
+    # suffix that depends on mRIDs -- treat as unstable (a classifier gap).
+    ambiguous: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "key": self.key,
+            "quantity": self.quantity.value,
+            "statistic": self.statistic.value,
+            "direction": self.direction.value,
+            "ambiguous": self.ambiguous,
             "mrid": self.mrid,
             "description": self.description,
             "meter_reading_href": self.meter_reading_href,
@@ -188,22 +215,24 @@ class Channel:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Channel:
+        # The classification is restored as stored, never recomputed: a key
+        # must keep meaning what it meant when it was assigned.
         rt = ReadingType.from_dict(d["reading_type"])
-        q, s, dirn = classify(rt, d.get("description"))
         return cls(
             key=d["key"],
             mrid=d.get("mrid"),
             description=d.get("description"),
             meter_reading_href=d["meter_reading_href"],
             reading_type=rt,
-            quantity=q,
-            statistic=s,
-            direction=dirn,
+            quantity=Quantity(d["quantity"]),
+            statistic=Statistic(d["statistic"]),
+            direction=Direction(d["direction"]),
             phase=rt.phase,
             reading_href=d.get("reading_href"),
             reading_set_list_href=d.get("reading_set_list_href"),
             tou_reading_list_href=d.get("tou_reading_list_href"),
             tou_tiers=tuple(d.get("tou_tiers") or ()),
+            ambiguous=bool(d.get("ambiguous", False)),
         )
 
 
@@ -252,6 +281,7 @@ class MeterProfile:
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": PROFILE_VERSION,
+            "key_scheme": KEY_SCHEME,
             "host": self.host,
             "port": self.port,
             "meter_lfdi": self.meter_lfdi,
@@ -268,8 +298,9 @@ class MeterProfile:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> MeterProfile:
         """Raises :class:`ProfileError` for another version or a malformed dict."""
-        if not isinstance(d, dict) or d.get("version") != PROFILE_VERSION:
-            raise ProfileError(f"unsupported profile version {d.get('version') if isinstance(d, dict) else d!r}")
+        if not isinstance(d, dict) or d.get("version") != PROFILE_VERSION or d.get("key_scheme") != KEY_SCHEME:
+            got = (d.get("version"), d.get("key_scheme")) if isinstance(d, dict) else d
+            raise ProfileError(f"unsupported profile (version, key scheme) {got!r}")
         try:
             return cls(
                 host=d["host"],
@@ -298,15 +329,14 @@ def resolve_href(base: str, href: str, host: str, port: int) -> str:
     against the resource they came from; absolute ones must point back at the
     meter itself -- a link elsewhere is a protocol error, never followed.
     """
-    origin = f"https://{host}:{port}"
-    url = urljoin(origin + base, href.strip())
-    parts = urlsplit(url)
-    default = 443 if parts.scheme == "https" else 80
-    if (
-        parts.scheme not in ("https", "http")
-        or (parts.hostname or "").lower() != host.lower().strip("[]")
-        or (parts.port or default) != port
-    ):
+    bare = host.strip("[]").split("%", 1)[0].lower()  # IPv6 literal without zone
+    origin = f"https://[{bare}]:{port}" if ":" in bare else f"https://{bare}:{port}"
+    try:
+        parts = urlsplit(urljoin(origin + base, href.strip()))
+        link_port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError as err:  # bad port, unbalanced brackets, ...
+        raise MeterProtocolError(f"malformed link from meter: {href!r}") from err
+    if parts.scheme not in ("https", "http") or (parts.hostname or "").lower() != bare or link_port != port:
         raise MeterProtocolError(f"link to another host: {href!r}")
     return parts.path + (f"?{parts.query}" if parts.query else "")
 
@@ -349,17 +379,17 @@ def _base_key(q: Quantity, s: Statistic, d: Direction, phase: int) -> str:
     parts = [q.value]
     if s != Statistic.INSTANTANEOUS:
         parts.append(s.value)
-    if d != Direction.NONE and (s != Statistic.INSTANTANEOUS or d in (Direction.RECEIVED, Direction.NET)):
+    if d != Direction.NONE and not (s == Statistic.INSTANTANEOUS and d == Direction.DELIVERED):
         # Instantaneous values that say "delivered" carry no direction in the
         # key: Itron's "Instantaneous Demand" is flowDirection=1 yet signed
-        # (negative while exporting). A separate received/net one does.
+        # (negative while exporting). Every other direction is kept.
         parts.append(d.value)
     if phase not in WHOLE_METER_PHASES:
         parts.append(_PHASES.get(phase, f"phase_{phase}"))
     return "_".join(parts)
 
 
-def assign_keys(entries: list[tuple[MeterReadingInfo, Quantity, Statistic, Direction, int]]) -> list[str]:
+def assign_keys(entries: list[tuple[MeterReadingInfo, Quantity, Statistic, Direction, int]]) -> list[tuple[str, bool]]:
     """Keys for classified MeterReadings, in input order.
 
     Channels that classify identically get ``_2``, ``_3``... in order of their
@@ -369,11 +399,19 @@ def assign_keys(entries: list[tuple[MeterReadingInfo, Quantity, Statistic, Direc
     groups: dict[str, list[int]] = {}
     for i, (_, q, s, d, phase) in enumerate(entries):
         groups.setdefault(_base_key(q, s, d, phase), []).append(i)
-    keys = [""] * len(entries)
+    keys: list[tuple[str, bool]] = [("", False)] * len(entries)
     for base, idxs in groups.items():
         idxs.sort(key=lambda i: (entries[i][0].mrid or "", _href_order(entries[i][0])))
+        ambiguous = len(idxs) > 1
+        if ambiguous:
+            _LOGGER.warning(
+                "%d meter readings classify as %r (%s); their keys depend on mRID order",
+                len(idxs),
+                base,
+                ", ".join(entries[i][0].description or entries[i][0].href for i in idxs),
+            )
         for n, i in enumerate(idxs):
-            keys[i] = base if n == 0 else f"{base}_{n + 1}"
+            keys[i] = (base if n == 0 else f"{base}_{n + 1}", ambiguous)
     return keys
 
 
@@ -440,17 +478,25 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
         mr_href = resolve(mr_list_href, mr.href) if mr.href else mr_list_href
         rt = ReadingType.from_xml(parse_xml(await batch.get(resolve(mr_href, mr.reading_type_href))))
         q, s, d = classify(rt, mr.description)
-        classified.append((mr, mr_href, rt, q, s, d))
-
-    keys = assign_keys([(mr, q, s, d, rt.phase) for mr, _, rt, q, s, d in classified])
-    channels: list[Channel] = []
-    for key, (mr, mr_href, rt, q, s, d) in zip(keys, classified, strict=True):
-        reading_href = resolve(mr_href, mr.reading_href) if mr.reading_href else None
         set_list_href = resolve(mr_href, mr.reading_set_list_href) if mr.reading_set_list_href else None
         tou_list: str | None = None
         tiers: tuple[int, ...] = ()
-        if s == Statistic.TOU_SUMMATION and set_list_href:
-            tou_list, tiers = await _discover_tou(batch, set_list_href, host, port)
+        if s == Statistic.TOU_SUMMATION:
+            tagged = False
+            if set_list_href:
+                tou_list, tiers, tagged = await _discover_tou(batch, set_list_href, host, port)
+            if not tagged and "tou" not in (mr.description or "").lower():
+                # numberOfTouTiers > 0 but no reading carries a touTier and the
+                # description does not say ToU: a plain register.
+                s, tou_list, tiers = Statistic.SUMMATION, None, ()
+        classified.append((mr, mr_href, rt, q, s, d, set_list_href, tou_list, tiers))
+
+    keys = assign_keys([(mr, q, s, d, rt.phase) for mr, _, rt, q, s, d, *_ in classified])
+    channels: list[Channel] = []
+    for (key, ambiguous), (mr, mr_href, rt, q, s, d, set_list_href, tou_list, tiers) in zip(
+        keys, classified, strict=True
+    ):
+        reading_href = resolve(mr_href, mr.reading_href) if mr.reading_href else None
         channels.append(
             Channel(
                 key=key,
@@ -466,6 +512,7 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
                 reading_set_list_href=set_list_href,
                 tou_reading_list_href=tou_list,
                 tou_tiers=tiers,
+                ambiguous=ambiguous,
             )
         )
 
@@ -484,20 +531,20 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
     )
 
 
-async def _discover_tou(batch: Batch, set_list_href: str, host: str, port: int) -> tuple[str | None, tuple[int, ...]]:
-    """The ToU tier ReadingList and the tiers in use (holding a value)."""
+async def _discover_tou(
+    batch: Batch, set_list_href: str, host: str, port: int
+) -> tuple[str | None, tuple[int, ...], bool]:
+    """The ToU tier ReadingList, the tiers in use (holding a value), and
+    whether any reading carries a touTier at all."""
     _, sets = await get_list(batch, set_list_href, "ReadingSet", limit=1)
     if not sets:
-        return None, ()
+        return None, (), False
     rs = ReadingSetInfo.from_xml(sets[0])
     if not rs.reading_list_href:
-        return None, ()
+        return None, (), False
     rs_href = resolve_href(set_list_href, rs.href, host, port) if rs.href else set_list_href
     list_href = resolve_href(rs_href, rs.reading_list_href, host, port)
-    _, readings = await get_list(batch, list_href, "Reading")
-    tiers = tuple(
-        sorted(
-            {r.tou_tier for r in map(Reading.from_xml, readings) if r.tou_tier is not None and r.raw_value is not None}
-        )
-    )
-    return list_href, tiers
+    _, elems = await get_list(batch, list_href, "Reading")
+    readings = [Reading.from_xml(e) for e in elems]
+    tiers = tuple(sorted({r.tou_tier for r in readings if r.tou_tier is not None and r.raw_value is not None}))
+    return list_href, tiers, any(r.tou_tier is not None for r in readings)

@@ -44,6 +44,15 @@ class MeterProtocolError(MeterError):
     """The meter answered, but not with something we understand."""
 
 
+class InvalidIdentity(MeterError):
+    """A client certificate/key that cannot be used: unparsable, mismatched,
+    expired, or not in the profile a meter accepts. ``problems`` lists why."""
+
+    def __init__(self, message: str, problems: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.problems = problems
+
+
 class ProfileError(MeterError):
     """A cached MeterProfile is from another library version or malformed:
     discover the meter again."""

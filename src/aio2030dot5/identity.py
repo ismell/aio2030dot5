@@ -13,9 +13,12 @@ Requires the ``cryptography`` package (an optional dependency of this library).
 from __future__ import annotations
 
 import hashlib
+import re
 import ssl
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+from .exceptions import InvalidIdentity
 
 IEEE_2030_5_SELF_SIGNED_POLICY = "1.3.6.1.4.1.40732.2.2"
 DEFAULT_COMMON_NAME = "MeterReaderHanClient"
@@ -35,6 +38,8 @@ def lfdi_from_pem(pem: str | bytes) -> str:
 def sfdi_from_lfdi(lfdi: str) -> str:
     """Short-form device identifier: leftmost 36 bits of the LFDI as decimal,
     plus a check digit making the digit sum a multiple of 10."""
+    if not re.fullmatch(r"[0-9A-Fa-f]{40}", lfdi):
+        raise ValueError(f"an LFDI is 40 hex digits, got {lfdi!r}")
     digits = str(int(lfdi[:9], 16))
     check = (10 - sum(int(d) for d in digits) % 10) % 10
     return f"{digits}{check}"
@@ -121,12 +126,17 @@ def generate_identity(*, common_name: str = DEFAULT_COMMON_NAME, valid_days: int
 
 def check_identity(cert_pem: bytes, key_pem: bytes | None = None, *, now: datetime | None = None) -> IdentityCheck:
     """Validate a certificate (and optionally its key) against what a meter
-    requires. Returns every problem found instead of raising on the first."""
+    requires. Returns every problem found instead of raising on the first;
+    raises :class:`InvalidIdentity` only when the input cannot be parsed."""
     from cryptography import x509
-    from cryptography.hazmat.primitives import serialization
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    cert = x509.load_pem_x509_certificate(cert_pem)
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem)
+    except ValueError as err:
+        raise InvalidIdentity("not a PEM certificate", ("certificate is not valid PEM",)) from err
     lfdi = lfdi_from_der(cert.public_bytes(serialization.Encoding.DER))
     problems: list[str] = []
     now = now or datetime.now(UTC)
@@ -139,6 +149,13 @@ def check_identity(cert_pem: bytes, key_pem: bytes | None = None, *, now: dateti
         problems.append("key is not ECDSA P-256")
     if cert.issuer != cert.subject:
         problems.append("certificate is not self-signed")
+    else:
+        try:
+            cert.verify_directly_issued_by(cert)
+        except (InvalidSignature, ValueError, TypeError):
+            problems.append("certificate's self-signature does not verify")
+    if not isinstance(cert.signature_hash_algorithm, hashes.SHA256):
+        problems.append("certificate is not signed with SHA-256")
     try:
         policies = cert.extensions.get_extension_for_class(x509.CertificatePolicies)
         oids = {p.policy_identifier.dotted_string for p in policies.value}
@@ -155,7 +172,11 @@ def check_identity(cert_pem: bytes, key_pem: bytes | None = None, *, now: dateti
     except x509.ExtensionNotFound:
         problems.append("missing keyUsage extension")
     if key_pem is not None:
-        key = serialization.load_pem_private_key(key_pem, password=None)
+        try:
+            key = serialization.load_pem_private_key(key_pem, password=None)
+        except (ValueError, TypeError) as err:
+            # TypeError: the key is encrypted.
+            raise InvalidIdentity("unusable private key", (f"private key: {err}",)) from err
         fmt = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         if key.public_key().public_bytes(*fmt) != pub.public_bytes(*fmt):
             problems.append("private key does not match the certificate")

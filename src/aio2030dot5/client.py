@@ -86,10 +86,12 @@ class Meter:
     def stats(self) -> TransportStats:
         return self.transport.stats
 
-    async def discover(self) -> MeterProfile:
-        """Walk the resource tree (~30 GETs, one connection)."""
+    async def discover(self, *, dcap_path: str = "/dcap") -> MeterProfile:
+        """Walk the resource tree (~30 GETs, one connection). ``dcap_path``
+        comes from the DNS-SD TXT record ``dcap`` when the meter was found by
+        mDNS."""
         async with self.transport.batch() as b:
-            return await discover(b, self.host, self.port)
+            return await discover(b, self.host, self.port, dcap_path=dcap_path)
 
     async def read(
         self,
@@ -159,11 +161,14 @@ class Meter:
     async def read_intervals_since(
         self, channel: Channel, since: datetime, *, complete_only: bool = True
     ) -> list[IntervalValue]:
-        """Completed intervals ending after ``since`` (oldest first)."""
+        """Completed intervals ending after ``since`` (an aware datetime), oldest first."""
+        if since.tzinfo is None:
+            raise ValueError("since must be timezone-aware (the meter speaks UTC)")
         wanted = [
             rs
             for rs in await self.list_interval_sets(channel)
-            if rs.start is not None and rs.start + timedelta(seconds=rs.duration or 0) > since
+            # A set of unknown length might reach past ``since``: keep it.
+            if rs.start is not None and (rs.duration is None or rs.start + timedelta(seconds=rs.duration) > since)
         ]
         values = await self.read_interval_sets(channel, wanted, complete_only=complete_only)
         return [v for v in values if v.end > since]
@@ -240,6 +245,8 @@ async def _read_sets(
     for rs in sets:
         if not rs.reading_list_href:
             continue
+        if rs.start is None:
+            continue  # cannot be placed in time
         try:
             _, elems = await get_list(b, rs.reading_list_href, "Reading")
         except MeterNotFound:

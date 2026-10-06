@@ -6,6 +6,7 @@ deploys with local "Launchpad" access, but nothing here is Xcel-specific.
 
 from .client import Meter, MeterSnapshot
 from .exceptions import (
+    InvalidIdentity,
     MeterAuthError,
     MeterBusy,
     MeterConnectionError,
@@ -27,6 +28,7 @@ __all__ = [
     "Channel",
     "Direction",
     "IntervalValue",
+    "InvalidIdentity",
     "Measurement",
     "Meter",
     "MeterAuthError",

@@ -26,6 +26,7 @@ import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from typing import Any
 
 from .exceptions import (
     MeterAuthError,
@@ -196,7 +197,10 @@ class _TlsConnection:
         return True
 
     def looks_dead(self) -> bool:
-        """True if the meter has already closed or reset this connection."""
+        """True if the meter has visibly reset or closed this connection.
+
+        Catches resets; a clean close_notify+FIN usually still sits unread in
+        the buffer, and is handled by the retry in Batch._request instead."""
         return self._reader.at_eof() or self._reader.exception() is not None or self._writer.is_closing()
 
     async def _handshake(self) -> None:
@@ -280,7 +284,11 @@ class _TlsConnection:
         connection = {t.strip() for t in headers.get("connection", "").lower().split(",")}
         keep_alive = version == "HTTP/1.1" and "close" not in connection
 
-        if 100 <= status < 200 or status in (204, 304):
+        if 100 <= status < 200:
+            # A 2030.5 meter never sends interim responses; half-supporting
+            # them could hand one GET's body to the next. Refuse.
+            raise MeterProtocolError(f"unexpected interim response {status}")
+        if status in (204, 304):
             # No body by definition (RFC 9112 section 6.3).
             body, self._buffer = b"", rest
         elif "chunked" in headers.get("transfer-encoding", "").lower():
@@ -291,8 +299,8 @@ class _TlsConnection:
                 length = int(headers["content-length"])
             except ValueError as err:
                 raise MeterProtocolError("bad Content-Length") from err
-            if length > _MAX_BODY_BYTES:
-                raise MeterProtocolError("HTTP body too large")
+            if length < 0 or length > _MAX_BODY_BYTES:
+                raise MeterProtocolError(f"bad Content-Length {length}")
             while len(rest) < length:
                 chunk = await self._recv_some()
                 if not chunk:
@@ -422,15 +430,23 @@ class _Shared:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_connect: float = -1e9
     last_close: float = -1e9
+    owner: asyncio.Task[Any] | None = None  # the task holding the lock
 
 
 _SHARED: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, int], _Shared]] = (
     weakref.WeakKeyDictionary()
 )
+_SHARED_STRONG: dict[int, dict[tuple[str, int], _Shared]] = {}  # loops that refuse weak references
 
 
 def _shared(host: str, port: int) -> _Shared:
-    per_loop = _SHARED.setdefault(asyncio.get_running_loop(), {})
+    """The state for one meter address. Keyed by the host string as given:
+    use one canonical host (e.g. the IP) for every Meter of one meter."""
+    loop = asyncio.get_running_loop()
+    try:
+        per_loop = _SHARED.setdefault(loop, {})
+    except TypeError:
+        per_loop = _SHARED_STRONG.setdefault(id(loop), {})
     return per_loop.setdefault((host.lower(), port), _Shared())
 
 
@@ -479,16 +495,23 @@ class MeterTransport:
         shared.last_connect = time.monotonic()
         t0 = time.monotonic()
         try:
-            conn = await self._open_once()
-        except _BadSignature:
-            # Meter-side signing glitch; observed ~1 in 190 handshakes, and an
-            # immediate second attempt has always succeeded.
-            self.stats.bad_signature_retries += 1
-            _LOGGER.debug("BAD_SIGNATURE from %s; retrying handshake once", self.host)
-            await asyncio.sleep(self.min_connect_interval)
-            shared.last_connect = time.monotonic()
-            t0 = time.monotonic()
-            conn = await self._open_once()
+            try:
+                conn = await self._open_once()
+            except _BadSignature:
+                # Meter-side signing glitch; observed ~1 in 190 handshakes, and
+                # an immediate second attempt has always succeeded.
+                self.stats.bad_signature_retries += 1
+                _LOGGER.debug("BAD_SIGNATURE from %s; retrying handshake once", self.host)
+                shared.last_close = time.monotonic()
+                await asyncio.sleep(self.min_connect_interval)
+                shared.last_connect = time.monotonic()
+                t0 = time.monotonic()
+                conn = await self._open_once()
+        except BaseException:
+            # A failed attempt counts as a close for pacing: a slow handshake
+            # that ends in a reset must not be followed by another at once.
+            shared.last_close = time.monotonic()
+            raise
         self.stats.last_handshake_ms = round((time.monotonic() - t0) * 1000)
         self.stats.connections += 1
         if conn.session_reused:
@@ -500,16 +523,33 @@ class MeterTransport:
         try:
             return await _TlsConnection.open(self.host, self.port, self._ctx, self._session, self.timeouts)
         except TimeoutError as err:
-            self.forget_session()
             raise MeterTimeout(f"TLS handshake with {self.host}:{self.port} timed out") from err
-        except MeterConnectionError:
-            # A failed resumption attempt must not poison the next connect.
+        except MeterAuthError:
             self.forget_session()
+            raise
+        except MeterConnectionError as err:
+            # Keep the session across plain network failures (refused, reset,
+            # timeout): the first connect after an outage should be the cheap
+            # resumed handshake. Drop it only if TLS itself failed, in case the
+            # resumption attempt is what the meter objected to.
+            if isinstance(err.__cause__, ssl.SSLError):
+                self.forget_session()
             raise
 
     @asynccontextmanager
     async def batch(self) -> AsyncIterator[Batch]:
-        async with self._lock:
+        """One connection's worth of requests, holding the meter's lock.
+
+        Not re-entrant: starting a batch for the same meter (via this or any
+        other Meter object) from inside one raises RuntimeError instead of
+        waiting forever on the lock.
+        """
+        shared = _shared(self.host, self.port)
+        task = asyncio.current_task()
+        if task is not None and shared.owner is task:
+            raise RuntimeError(f"nested batch on {self.host}:{self.port} would deadlock")
+        async with shared.lock:
+            shared.owner = task
             b = Batch(self)
             try:
                 yield b
@@ -518,6 +558,7 @@ class MeterTransport:
                 raise
             finally:
                 b._closed = True
+                shared.owner = None
                 try:
                     await b.close()
                 finally:
@@ -596,6 +637,11 @@ class Batch:
     async def _request_once(self, path: str) -> Response:
         t = self._t
         if self._conn is None:
+            if self._closed:
+                # The batch ended while this request was waiting (e.g. a task
+                # left running by gather()): connecting now would be outside
+                # the lock, beside whatever holds it.
+                raise RuntimeError("Batch used after its batch() block exited")
             self._conn = await t._connect()
         conn = self._conn
         host = _host_header(t.host, t.port)

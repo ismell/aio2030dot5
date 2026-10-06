@@ -20,11 +20,30 @@ This library is designed around that:
 - **TLS session resumption.** A full ECDHE-ECDSA handshake costs the meter ~330 ms; a resumed one
   ~60–160 ms. asyncio's TLS transport cannot resume sessions, so TLS runs through `ssl.MemoryBIO`.
 - **Correct HTTP framing.** It reads by Content-Length or chunked framing and never waits for EOF.
-- **Policy-free.** There is no polling loop and no retries beyond one `BAD_SIGNATURE` handshake retry. Exceptions say
-  what happened (`MeterConnectionError`/`MeterTimeout` → back off; `MeterAuthError` → certificate not
-  registered or expired; `MeterNotFound` → rediscover), and the caller decides.
+- **Policy-free.** There is no polling loop. The only retries are transport-level and bounded:
+  - one handshake retry after `BAD_SIGNATURE`;
+  - one reconnect when the meter drops a kept-alive connection before answering (GET is idempotent).
+
+  Exceptions say what happened, and the caller decides:
+  - `MeterConnectionError`, `MeterTimeout` or `MeterBusy` → back off;
+  - `MeterAuthError(reason=...)` → the certificate is not registered, or expired;
+  - `MeterNotFound` → rediscover;
+  - `ProfileError` → a cached profile is stale.
+
+  One call can take a while on a struggling meter: pacing, connect, a handshake retry and the response add up to
+  about 3 minutes with the default timeouts. Wrap calls in your own deadline if you need one.
+- **One meter, one lock.** Every `Meter` object for the same `(host, port)` on an event loop shares a lock and
+  connection pacing. Use one canonical host string per meter. Batches are not re-entrant: starting one from inside
+  another raises `RuntimeError` rather than deadlocking.
 - **Discovery by meaning, not by path.** Each MeterReading is classified from its ReadingType
-  (quantity, statistic, direction, phase), so callers ask for "energy delivered" rather than `/upt/1/mr/3`.
+  (quantity, statistic, direction, phase), with its description breaking ties older agents leave. Callers ask for
+  "energy delivered" rather than `/upt/1/mr/3`.
+- **Stable channel keys.**
+  - Keys are public API: `{quantity}[_{statistic}][_{direction}][_{phase}]`, e.g. `energy_summation_delivered`.
+  - `power` is the signed instantaneous demand.
+  - They are pinned by tests against real agent captures, and versioned by `KEY_SCHEME`: a cached profile from
+    another scheme raises `ProfileError`.
+  - Two readings that classify identically are numbered `_2`, `_3` in mRID order and flagged `ambiguous`.
 
 ## Usage
 
