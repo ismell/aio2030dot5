@@ -126,6 +126,7 @@ class _TlsConnection:
         self._buffer = b""
         self.eof = False
         self.requests = 0
+        self.last_used = time.monotonic()
 
     @classmethod
     async def open(
@@ -144,14 +145,18 @@ class _TlsConnection:
         except OSError as err:
             raise MeterConnectionError(f"connect to {host}:{port} failed: {err}") from err
 
-        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
-        sslobj = ctx.wrap_bio(incoming, outgoing, server_side=False, session=session)
-        conn = cls(reader, writer, sslobj, incoming, outgoing)
+        try:
+            incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+            sslobj = ctx.wrap_bio(incoming, outgoing, server_side=False, session=session)
+            conn = cls(reader, writer, sslobj, incoming, outgoing)
+        except BaseException:
+            writer.transport.abort()
+            raise
         try:
             async with asyncio.timeout(timeouts.handshake):
                 await conn._handshake()
         except BaseException:
-            conn._abort()
+            conn.abort()
             raise
         return conn
 
@@ -163,20 +168,34 @@ class _TlsConnection:
     def session_reused(self) -> bool:
         return self._ssl.session_reused
 
+    # _flush and _feed are the only places that touch the socket, so every
+    # OSError (a reset from a meter that is clamping down, a broken pipe) is
+    # turned into a MeterConnectionError here and nowhere else.
+
     async def _flush(self) -> None:
         data = self._out.read()
         if data:
-            self._writer.write(data)
-            await self._writer.drain()
+            try:
+                self._writer.write(data)
+                await self._writer.drain()
+            except OSError as err:
+                raise MeterConnectionError(f"send to meter failed: {err}") from err
 
     async def _feed(self) -> bool:
         """Move bytes from the socket into the TLS engine. False on EOF."""
-        data = await self._reader.read(_READ_SIZE)
+        try:
+            data = await self._reader.read(_READ_SIZE)
+        except OSError as err:
+            raise MeterConnectionError(f"receive from meter failed: {err}") from err
         if not data:
             self._in.write_eof()
             return False
         self._in.write(data)
         return True
+
+    def looks_dead(self) -> bool:
+        """True if the meter has already closed or reset this connection."""
+        return self._reader.at_eof() or self._reader.exception() is not None or self._writer.is_closing()
 
     async def _handshake(self) -> None:
         while True:
@@ -188,34 +207,35 @@ class _TlsConnection:
                 if not await self._feed():
                     raise MeterConnectionError("meter closed the connection during the TLS handshake") from None
             except ssl.SSLError as err:
+                # Best effort: let the meter see our alert before the close.
+                with suppress(Exception):
+                    await asyncio.wait_for(self._flush(), 0.5)
                 raise _classify_ssl_error(err) from err
         await self._flush()
 
     async def send(self, data: bytes) -> None:
+        self.last_used = time.monotonic()
         try:
             self._ssl.write(data)
         except ssl.SSLError as err:
             raise MeterConnectionError(f"TLS write failed: {err}") from err
-        try:
-            await self._flush()
-        except OSError as err:
-            raise MeterConnectionError(f"send failed: {err}") from err
+        await self._flush()
 
     async def _recv_some(self) -> bytes:
         """Decrypted bytes, or b"" once the meter has closed the connection."""
         while True:
             try:
-                return self._ssl.read(_READ_SIZE)
+                data = self._ssl.read(_READ_SIZE)
+                if not data:
+                    # A clean close_notify: SSLObject.read() returns b"".
+                    self.eof = True
+                self.last_used = time.monotonic()
+                return data
             except ssl.SSLWantReadError:
                 await self._flush()
-                try:
-                    more = await self._feed()
-                except OSError as err:
-                    raise MeterConnectionError(f"receive failed: {err}") from err
-                if not more:
-                    # Loop once more so the engine can surface close_notify
-                    # (SSLZeroReturnError) or a truncation (SSLEOFError).
-                    continue
+                # On EOF, loop once more so the engine can report close_notify
+                # (b"" above) or a truncated stream (SSLEOFError below).
+                await self._feed()
             except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
                 self.eof = True
                 return b""
@@ -228,7 +248,14 @@ class _TlsConnection:
         while b"\r\n\r\n" not in buf:
             if len(buf) > _MAX_HEADER_BYTES:
                 raise MeterProtocolError("HTTP response headers too large")
-            chunk = await self._recv_some()
+            try:
+                chunk = await self._recv_some()
+            except MeterConnectionError as err:
+                if buf:
+                    raise
+                # Reset before the first response byte: on a reused
+                # connection this is the meter's idle close racing us.
+                raise _EmptyResponse(str(err)) from err
             if not chunk:
                 raise _EmptyResponse() if not buf else MeterConnectionError("meter closed the connection mid-headers")
             buf += chunk
@@ -245,10 +272,16 @@ class _TlsConnection:
             if sep:
                 headers[name.strip().lower()] = value.strip()
 
-        connection = headers.get("connection", "").lower()
-        keep_alive = version == "HTTP/1.1" and connection != "close"
+        connection = {t.strip() for t in headers.get("connection", "").lower().split(",")}
+        keep_alive = version == "HTTP/1.1" and "close" not in connection
 
-        if "content-length" in headers:
+        if 100 <= status < 200 or status in (204, 304):
+            # No body by definition (RFC 9112 section 6.3).
+            body, self._buffer = b"", rest
+        elif "chunked" in headers.get("transfer-encoding", "").lower():
+            # Chunked framing wins over Content-Length (RFC 9112 section 6.3).
+            body, self._buffer = await self._read_chunked(rest)
+        elif "content-length" in headers:
             try:
                 length = int(headers["content-length"])
             except ValueError as err:
@@ -261,8 +294,6 @@ class _TlsConnection:
                     raise MeterConnectionError("meter closed the connection mid-body")
                 rest += chunk
             body, self._buffer = rest[:length], rest[length:]
-        elif "chunked" in headers.get("transfer-encoding", "").lower():
-            body, self._buffer = await self._read_chunked(rest)
         else:
             # No framing: the body runs to EOF and the connection is spent.
             while True:
@@ -289,6 +320,8 @@ class _TlsConnection:
                 size = int(size_line.split(b";")[0], 16)
             except ValueError as err:
                 raise MeterProtocolError("bad chunk size") from err
+            if size < 0:
+                raise MeterProtocolError("negative chunk size")
             while len(rest) < size + 2:
                 chunk = await self._recv_some()
                 if not chunk:
@@ -299,7 +332,7 @@ class _TlsConnection:
                 while not rest.startswith(b"\r\n") and b"\r\n\r\n" not in rest:
                     chunk = await self._recv_some()
                     if not chunk:
-                        break
+                        raise MeterConnectionError("meter closed the connection mid-trailer")
                     rest += chunk
                 end = 2 if rest.startswith(b"\r\n") else rest.index(b"\r\n\r\n") + 4
                 return body, rest[end:]
@@ -309,25 +342,34 @@ class _TlsConnection:
             rest = rest[size + 2 :]
 
     async def close(self) -> None:
-        """Send close_notify and close. Never raises."""
-        with suppress(Exception):
-            self._ssl.unwrap()
-        with suppress(Exception):
-            await asyncio.wait_for(self._flush(), 1.0)
-        self._abort()
+        """Send close_notify and close. Never raises; even if cancelled
+        midway, the socket is released (it holds the meter's only slot)."""
+        try:
+            with suppress(Exception):
+                self._ssl.unwrap()
+            with suppress(Exception):
+                await asyncio.wait_for(self._flush(), 1.0)
+        finally:
+            self.abort()
         with suppress(Exception):
             await asyncio.wait_for(self._writer.wait_closed(), 1.0)
 
-    def _abort(self) -> None:
+    def abort(self) -> None:
+        """Drop the TCP connection now, synchronously (safe in any state)."""
         with suppress(Exception):
-            self._writer.close()
+            self._writer.transport.abort()
 
 
 class _EmptyResponse(MeterConnectionError):
-    """The meter closed a kept-alive connection before answering: safe to retry."""
+    """The meter closed or reset the connection before any response byte.
 
-    def __init__(self) -> None:
-        super().__init__("meter closed the connection before responding")
+    On a reused keep-alive connection that is the meter's idle close racing
+    our request, and the (idempotent) GET is safe to retry once.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        msg = "meter closed the connection before responding"
+        super().__init__(f"{msg} ({detail})" if detail else msg)
 
 
 def _classify_ssl_error(err: ssl.SSLError) -> Exception:
@@ -442,7 +484,11 @@ class MeterTransport:
                 self.stats.failures += 1
                 raise
             finally:
-                await b.close()
+                b._closed = True
+                try:
+                    await b.close()
+                finally:
+                    b._kill()
 
     async def get(self, path: str) -> bytes:
         async with self.batch() as b:
@@ -456,6 +502,8 @@ class Batch:
         self._t = transport
         self._conn: _TlsConnection | None = None
         self._last_request = -1e9
+        self._busy = False
+        self._closed = False
 
     async def get(self, path: str) -> bytes:
         """GET ``path``; return the body of a 2xx response."""
@@ -467,21 +515,42 @@ class Batch:
         return resp.body
 
     async def request(self, path: str) -> Response:
+        # A Batch owns one connection and must stay on one task: two requests
+        # interleaving on it would corrupt the stream or open a second
+        # connection, and one used after batch() exits would hold no lock.
+        if self._closed:
+            raise RuntimeError("Batch used after its batch() block exited")
+        if self._busy:
+            raise RuntimeError("Batch is not safe for concurrent use; await one request at a time")
+        self._busy = True
+        try:
+            return await self._request(path)
+        finally:
+            self._busy = False
+
+    async def _request(self, path: str) -> Response:
         t = self._t
+        target = _request_target(path)
         wait = self._last_request + t.request_spacing - time.monotonic()
         if wait > 0:
             await asyncio.sleep(wait)
+        if self._conn is not None and (
+            self._conn.looks_dead() or time.monotonic() - self._conn.last_used > REUSE_IDLE_LIMIT
+        ):
+            # Closed by the meter, or close to its 30 s idle timeout: start
+            # a fresh (resumed) connection rather than race the close.
+            await self.close()
         reused = self._conn is not None
         try:
-            return await self._request_once(path)
+            return await self._request_once(target)
         except _EmptyResponse:
             if not reused:
                 raise
-            # The meter dropped a kept-alive connection before answering (e.g.
-            # its 30 s idle timer raced us). GET is idempotent: reconnect once.
+            # The meter dropped a kept-alive connection before answering.
+            # GET is idempotent: reconnect once.
             t.stats.reconnects_mid_batch += 1
             await self.close()
-            return await self._request_once(path)
+            return await self._request_once(target)
         finally:
             self._last_request = time.monotonic()
 
@@ -490,18 +559,24 @@ class Batch:
         if self._conn is None:
             self._conn = await t._connect()
         conn = self._conn
-        request = (f"GET {path} HTTP/1.1\r\nHost: {t.host}:{t.port}\r\nAccept: {CONTENT_TYPE}\r\n\r\n").encode("ascii")
+        host = _host_header(t.host, t.port)
+        request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: {CONTENT_TYPE}\r\n\r\n".encode("ascii")
         t.stats.requests += 1
         conn.requests += 1
         try:
             async with asyncio.timeout(t.timeouts.response):
-                await conn.send(request)
+                try:
+                    await conn.send(request)
+                except MeterConnectionError as err:
+                    raise _EmptyResponse(str(err)) from err
                 resp = await conn.read_response()
-        except TimeoutError as err:
-            await self.close()
-            raise MeterTimeout(f"GET {path} timed out after {t.timeouts.response:.0f} s") from err
-        except MeterConnectionError:
-            await self.close()
+        except BaseException as err:
+            # Whatever went wrong -- our timeout, the caller's cancellation, a
+            # reset -- the connection may hold half a response. Drop it now,
+            # synchronously, so it is never reused.
+            self._kill()
+            if isinstance(err, TimeoutError):
+                raise MeterTimeout(f"GET {path} timed out after {t.timeouts.response:.0f} s") from err
             raise
         if not resp.keep_alive:
             await self.close()
@@ -511,3 +586,26 @@ class Batch:
         if self._conn is not None:
             conn, self._conn = self._conn, None
             await conn.close()
+
+    def _kill(self) -> None:
+        if self._conn is not None:
+            conn, self._conn = self._conn, None
+            conn.abort()
+
+
+# Reconnect instead of reusing a connection idle this long (the meter closes
+# idle connections at 30 s).
+REUSE_IDLE_LIMIT = 25.0
+
+
+def _request_target(path: str) -> str:
+    """Validate a request target taken from meter XML: an origin-form path of
+    printable ASCII. Anything else is a protocol error, never a header
+    injection or a request to another host."""
+    if not path.startswith("/") or not path.isascii() or not path.isprintable() or " " in path:
+        raise MeterProtocolError(f"unusable href from meter: {path!r}")
+    return path
+
+
+def _host_header(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"

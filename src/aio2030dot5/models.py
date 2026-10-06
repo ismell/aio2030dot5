@@ -159,7 +159,29 @@ def expect_root(elem: ET.Element, name: str) -> None:
 def epoch(value: int | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromtimestamp(value, UTC)
+    try:
+        return datetime.fromtimestamp(value, UTC)
+    except (OverflowError, OSError, ValueError) as err:
+        raise MeterProtocolError(f"timestamp out of range: {value}") from err
+
+
+def int_attr(elem: ET.Element, name: str, default: int = 0) -> int:
+    raw = elem.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as err:
+        raise MeterProtocolError(f"attribute {name}={raw!r} is not an integer") from err
+
+
+def hex_or_none(value: str | None, what: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value, 16)
+    except ValueError as err:
+        raise MeterProtocolError(f"{what} {value!r} is not hexBinary") from err
 
 
 # -- resources ----------------------------------------------------------------
@@ -174,7 +196,7 @@ class ListPage:
 
     @classmethod
     def of(cls, elem: ET.Element) -> ListPage:
-        return cls(all=int(elem.get("all", "0")), results=int(elem.get("results", "0")))
+        return cls(all=int_attr(elem, "all"), results=int_attr(elem, "results"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,11 +227,11 @@ class MeterTime:
     @classmethod
     def from_xml(cls, root: ET.Element) -> MeterTime:
         expect_root(root, "Time")
-        current = int_or_none(root, "currentTime")
+        current = epoch(int_or_none(root, "currentTime"))
         if current is None:
             raise MeterProtocolError("Time has no currentTime")
         return cls(
-            current_time=datetime.fromtimestamp(current, UTC),
+            current_time=current,
             tz_offset=int_or_none(root, "tzOffset") or 0,
             dst_offset=int_or_none(root, "dstOffset") or 0,
             quality=int_or_none(root, "quality"),
@@ -395,7 +417,7 @@ class Reading:
             tou_tier=int_or_none(elem, "touTier"),
             quality_flags=text(elem, "qualityFlags"),
             # localID is hexBinary in the schema ("2F" for slot 47).
-            local_id=int(local_id, 16) if local_id is not None else None,
+            local_id=hex_or_none(local_id, "localID"),
         )
 
 
@@ -423,7 +445,7 @@ class ReadingSetInfo:
             start=epoch(start),
             duration=duration,
             reading_list_href=rl.get("href") if rl is not None else None,
-            reading_count=int(rl.get("all", "0")) if rl is not None and rl.get("all") else None,
+            reading_count=int_attr(rl, "all") if rl is not None and rl.get("all") else None,
         )
 
 

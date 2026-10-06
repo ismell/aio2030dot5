@@ -142,7 +142,12 @@ class FakeMeter:
                 return
             threading.Thread(target=self._handle, args=(raw,), daemon=True).start()
 
+    def _release(self) -> None:
+        with self._lock:
+            self._active -= 1
+
     def _handle(self, raw: socket.socket) -> None:
+        released = False
         with self._lock:
             self._active += 1
             self.log.connections += 1
@@ -186,6 +191,10 @@ class FakeMeter:
                     head += "Content-Type: application/sep+xml\r\n"
                 tls.sendall(head.encode() + b"\r\n" + payload)
                 if close:
+                    # The meter has decided to close: its slot is free from
+                    # here on, even while close_notify is still in flight.
+                    self._release()
+                    released = True
                     if self.clean_close:
                         try:
                             tls.unwrap()
@@ -194,8 +203,8 @@ class FakeMeter:
                     tls.close()
                     return
         finally:
-            with self._lock:
-                self._active -= 1
+            if not released:
+                self._release()
             try:
                 raw.close()
             except OSError:
