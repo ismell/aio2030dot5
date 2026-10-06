@@ -61,8 +61,10 @@ async def test_concurrent_use_of_one_batch_is_refused(pki: Pki) -> None:
         meter = make_meter(pki, fm.port)
         async with meter.transport.batch() as b:
             results = await asyncio.gather(b.get("/dcap?slow=1"), b.get("/tm"), return_exceptions=True)
-        assert isinstance(results[1], RuntimeError)
-        assert fm.log.max_concurrent == 1 and fm.log.connections == 1
+        # gather() runs each in its own task: a Batch belongs to the task that
+        # opened it, so neither may connect beside the lock holder.
+        assert all(isinstance(r, RuntimeError) for r in results)
+        assert fm.log.connections == 0
 
 
 async def test_batch_is_dead_after_its_block(pki: Pki) -> None:

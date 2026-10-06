@@ -306,6 +306,9 @@ class MeterProfile:
         if not isinstance(d, dict) or d.get("version") != PROFILE_VERSION or d.get("key_scheme") != KEY_SCHEME:
             got = (d.get("version"), d.get("key_scheme")) if isinstance(d, dict) else d
             raise ProfileError(f"unsupported profile (version, key scheme) {got!r}")
+        pin = d.get("certificate_lfdi")
+        if pin is not None and (not isinstance(pin, str) or not re.fullmatch(r"[0-9A-F]{40}", pin)):
+            raise ProfileError(f"malformed certificate_lfdi {pin!r}")
         try:
             return cls(
                 host=d["host"],

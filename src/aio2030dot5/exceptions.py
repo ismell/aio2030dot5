@@ -29,7 +29,8 @@ class MeterIdentityMismatch(MeterConnectionError):
     """
 
     def __init__(self, host: str, expected: str, actual: str | None) -> None:
-        super().__init__(f"{host} is not the expected meter: LFDI {actual or 'unknown'}, expected {expected}")
+        who = f"LFDI {actual}" if actual else "a device that did not prove its identity"
+        super().__init__(f"{host} is not the expected meter: {who}, expected {expected}")
         self.host = host
         self.expected = expected
         self.actual = actual

@@ -59,6 +59,7 @@ REDACT_KEYS = frozenset(
         "serial_number",
         "mrid",
         "host",
+        "instance",  # an mDNS instance name carries the SFDI
     }
 )
 

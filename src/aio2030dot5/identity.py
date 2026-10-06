@@ -57,12 +57,15 @@ class Identity:
     derived from the certificate.
     """
 
-    cert_pem: str
+    cert_pem: str = field(repr=False)
     key_pem: str = field(repr=False)
     lfdi: str
     sfdi: str
     not_after: datetime
     problems: tuple[str, ...] = ()  # what check_identity() found when loaded
+
+    def __repr__(self) -> str:  # never any PEM text, whatever was loaded
+        return f"Identity(lfdi={self.lfdi!r}, not_after={self.not_after.isoformat()!r}, problems={self.problems!r})"
 
     def days_remaining(self, now: datetime | None = None) -> int:
         return (self.not_after - (now or datetime.now(UTC))).days
@@ -79,10 +82,10 @@ class Identity:
         """Reload a stored identity. Tolerates expiry and profile problems
         (they are in ``problems``); raises :class:`InvalidIdentity` only if it
         cannot be used at all."""
-        try:
-            cert, key = data["cert_pem"], data["key_pem"]
-        except (KeyError, TypeError) as err:
-            raise InvalidIdentity("not a stored identity", ("missing cert_pem or key_pem",)) from err
+        cert = data.get("cert_pem") if isinstance(data, dict) else None
+        key = data.get("key_pem") if isinstance(data, dict) else None
+        if not isinstance(cert, str) or not isinstance(key, str):
+            raise InvalidIdentity("not a stored identity", ("cert_pem and key_pem must be PEM text",))
         return load_identity(cert, key, strict=False)
 
 
@@ -172,19 +175,40 @@ def load_identity(
     reloading one already in use): only an unusable pair raises, and the
     rest are kept in ``Identity.problems``.
     """
-    cert_b = cert_pem.encode("ascii", "replace") if isinstance(cert_pem, str) else cert_pem
-    key_b = key_pem.encode("ascii", "replace") if isinstance(key_pem, str) else key_pem
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    blobs = []
+    for value, what in ((cert_pem, "certificate"), (key_pem, "private key")):
+        if isinstance(value, str):
+            try:
+                value = value.encode("ascii")
+            except UnicodeEncodeError:
+                raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",)) from None
+        if not isinstance(value, bytes):
+            raise InvalidIdentity(f"the {what} must be PEM text", (f"{what} is missing",))
+        blobs.append(value)
+    cert_b, key_b = blobs
+    # Exactly one block each: a "certificate" that also carries the key would
+    # otherwise be stored -- and shown -- as the certificate.
+    if cert_b.count(b"-----BEGIN ") != 1 or b"PRIVATE KEY" in cert_b:
+        raise InvalidIdentity(
+            "the certificate field must hold one certificate", ("certificate field holds extra PEM blocks",)
+        )
+    if key_b.count(b"-----BEGIN ") != 1:
+        raise InvalidIdentity("the key field must hold one private key", ("key field holds extra PEM blocks",))
     check = check_identity(cert_b, key_b, now=now)
     fatal = [p for p in check.problems if p in _FATAL]
     if fatal or (strict and check.problems):
         raise InvalidIdentity("identity cannot be used: " + "; ".join(check.problems), check.problems)
-    try:
-        cert_text, key_text = cert_b.decode("ascii").strip() + "\n", key_b.decode("ascii").strip() + "\n"
-    except UnicodeDecodeError as err:
-        raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",)) from err
+    # Store canonical re-encodings, never the text as given.
+    cert = x509.load_pem_x509_certificate(cert_b)
+    key = serialization.load_pem_private_key(key_b, password=None)
     return Identity(
-        cert_pem=cert_text,
-        key_pem=key_text,
+        cert_pem=cert.public_bytes(serialization.Encoding.PEM).decode("ascii"),
+        key_pem=key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        ).decode("ascii"),
         lfdi=check.lfdi,
         sfdi=check.sfdi,
         not_after=check.not_after,

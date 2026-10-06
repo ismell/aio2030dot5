@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .exceptions import (
+    InvalidIdentity,
     MeterAuthError,
     MeterBusy,
     MeterConnectionError,
@@ -64,8 +65,17 @@ def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
     registered with the utility.
     """
     ctx = _client_context()
-    ctx.load_cert_chain(cert_path, key_path)
+    try:
+        ctx.load_cert_chain(cert_path, key_path, password=_no_password)
+    except ssl.SSLError as err:
+        raise InvalidIdentity(f"cannot use the client certificate/key: {err.reason or err}") from None
     return ctx
+
+
+def _no_password() -> str:
+    # Without a password callback OpenSSL prompts on the terminal for an
+    # encrypted key -- hanging an executor thread forever.
+    raise InvalidIdentity("the private key is encrypted", ("private key is encrypted",))
 
 
 def build_ssl_context_from_pem(cert_pem: str | bytes, key_pem: str | bytes) -> ssl.SSLContext:
@@ -78,17 +88,19 @@ def build_ssl_context_from_pem(cert_pem: str | bytes, key_pem: str | bytes) -> s
     fresh private directory (mode 0700, files 0600) that is removed before
     this returns, so the key is on disk only for the duration of the call.
     """
-    ctx = _client_context()
+    try:
+        blobs = [p.encode("ascii") if isinstance(p, str) else bytes(p) for p in (cert_pem, key_pem)]
+    except (UnicodeEncodeError, TypeError):
+        raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",)) from None
     with tempfile.TemporaryDirectory(prefix="aio2030dot5-") as tmp:
         paths = []
-        for name, pem in (("cert.pem", cert_pem), ("key.pem", key_pem)):
+        for name, blob in zip(("cert.pem", "key.pem"), blobs, strict=True):
             path = os.path.join(tmp, name)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as f:
-                f.write(pem.encode("ascii") if isinstance(pem, str) else pem)
+                f.write(blob)
             paths.append(path)
-        ctx.load_cert_chain(paths[0], paths[1])
-    return ctx
+        return build_ssl_context(paths[0], paths[1])
 
 
 async def async_build_ssl_context(identity: Identity) -> ssl.SSLContext:
@@ -193,6 +205,12 @@ class _CertificateTap:
         self._handshake = b""
         self._seen = 0
         self.chain: tuple[bytes, ...] | None = None
+        # True once ServerHelloDone followed the Certificate. By then OpenSSL
+        # has checked the ServerKeyExchange signature (mandatory with the
+        # only cipher suite offered) against the certificate's key, so the
+        # peer holds that key. A refusal before that point could come from
+        # anything replaying the meter's (public) certificate.
+        self.proven = False
         self.done = False
 
     def feed(self, data: bytes) -> None:
@@ -222,8 +240,10 @@ class _CertificateTap:
             body, self._handshake = self._handshake[4 : 4 + length], self._handshake[4 + length :]
             if kind == 11:  # Certificate
                 self.chain = _certificate_list(body)
-                self.done = True
-            elif kind == 14:  # ServerHelloDone: no certificate is coming
+                if self.chain is None:
+                    self.done = True
+            elif kind == 14:  # ServerHelloDone: the server's flight is complete
+                self.proven = self.chain is not None
                 self.done = True
 
 
@@ -308,12 +328,16 @@ class _TlsConnection:
         return self._ssl.session_reused
 
     def peer_chain(self) -> tuple[bytes, ...] | None:
-        """The meter's certificate chain, leaf first. A resumed session has
-        no Certificate message; OpenSSL keeps the leaf in the session."""
-        if self._tap is not None and self._tap.chain:
-            return self._tap.chain
+        """The meter's certificate chain, leaf first, after a completed
+        handshake. OpenSSL's leaf is authoritative (a resumed session has no
+        Certificate message; it keeps the leaf in the session); the tapped
+        chain only adds the intermediates when its leaf agrees."""
         der = self._ssl.getpeercert(binary_form=True)
-        return (der,) if der else None
+        if not der:
+            return None
+        if self._tap is not None and self._tap.chain and self._tap.chain[0] == der:
+            return self._tap.chain
+        return (der,)
 
     # _flush and _feed are the only places that touch the socket, so every
     # OSError (a reset from a meter that is clamping down, a broken pipe) is
@@ -560,6 +584,18 @@ class _BadSignature(MeterConnectionError):
     pass
 
 
+async def _pace(seconds: float, deadline: asyncio.Timeout | None) -> None:
+    """Sleep for connection pacing without spending the caller's deadline:
+    the deadline is moved out by the same amount first."""
+    if seconds <= 0:
+        return
+    if deadline is not None:
+        when = deadline.when()
+        if when is not None:
+            deadline.reschedule(when + seconds)
+    await asyncio.sleep(seconds)
+
+
 # -- the public transport -----------------------------------------------------
 
 
@@ -647,13 +683,15 @@ class MeterTransport:
     def forget_session(self) -> None:
         self._session = None
 
-    async def _connect(self, *, verify: bool = True) -> _TlsConnection:
+    async def _connect(self, *, verify: bool = True, deadline: asyncio.Timeout | None = None) -> _TlsConnection:
         shared = _shared(self.host, self.port)
+        task = asyncio.current_task()
+        if shared.owner is not None and task is not None and shared.owner is not task:
+            raise RuntimeError("a Batch must be used from the task that opened it")
         # Spaced from the last connect AND the last close: a long batch must
         # not be followed by a connect the instant it ends.
         wait = max(shared.last_connect, shared.last_close) + self.min_connect_interval - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
+        await _pace(wait, deadline)
         shared.last_connect = time.monotonic()
         t0 = time.monotonic()
         try:
@@ -665,7 +703,7 @@ class MeterTransport:
                 self.stats.bad_signature_retries += 1
                 _LOGGER.debug("BAD_SIGNATURE from %s; retrying handshake once", self.host)
                 shared.last_close = time.monotonic()
-                await asyncio.sleep(self.min_connect_interval)
+                await _pace(self.min_connect_interval, deadline)
                 shared.last_connect = time.monotonic()
                 t0 = time.monotonic()
                 conn = await self._open_once(verify)
@@ -704,7 +742,8 @@ class MeterTransport:
             raise MeterTimeout(f"TLS handshake with {self.host}:{self.port} timed out") from err
         except MeterAuthError:
             self.forget_session()
-            self._record_peer(tap.chain)
+            # Only a certificate the peer proved it holds the key for.
+            self._record_peer(tap.chain if tap.proven else None)
             if verify:
                 # A device that is not our meter would refuse our certificate
                 # too: report the real problem, the address.
@@ -750,8 +789,8 @@ class MeterTransport:
             raise RuntimeError(f"nested batch on {self.host}:{self.port} would deadlock")
         async with shared.lock:
             shared.owner = task
-            b = Batch(self, verify_identity)
             deadline = asyncio.timeout(self.timeouts.batch)
+            b = Batch(self, verify_identity, deadline)
             try:
                 try:
                     async with deadline:
@@ -759,7 +798,7 @@ class MeterTransport:
                 except TimeoutError as err:
                     if deadline.expired():
                         raise MeterTimeout(
-                            f"{self.host}:{self.port}: call exceeded its {self.timeouts.batch:.0f} s deadline"
+                            f"{self.host}:{self.port}: call exceeded its {self.timeouts.batch:g} s deadline"
                         ) from err
                     raise
             except Exception:
@@ -781,9 +820,12 @@ class MeterTransport:
 class Batch:
     """GETs on one connection. Created only by :meth:`MeterTransport.batch`."""
 
-    def __init__(self, transport: MeterTransport, verify_identity: bool = True) -> None:
+    def __init__(
+        self, transport: MeterTransport, verify_identity: bool = True, deadline: asyncio.Timeout | None = None
+    ) -> None:
         self._t = transport
         self._verify = verify_identity
+        self._deadline = deadline
         self._conn: _TlsConnection | None = None
         self._peer: PeerCertificate | None = None
         self._last_request = -1e9
@@ -812,14 +854,17 @@ class Batch:
             raise RuntimeError("Batch used after its batch() block exited")
         if self._busy:
             raise RuntimeError("Batch is not safe for concurrent use; await one request at a time")
-        if self._conn is None or self._conn.looks_dead():
-            await self.close()
-            self._busy = True
-            try:
-                self._conn = await self._t._connect(verify=self._verify)
+        self._busy = True
+        try:
+            if self._conn is not None and self._conn.looks_dead():
+                await self.close()
+            if self._conn is None:
+                if self._closed:  # the batch ended while close() ran
+                    raise RuntimeError("Batch used after its batch() block exited")
+                self._conn = await self._t._connect(verify=self._verify, deadline=self._deadline)
                 self._peer = self._t.peer
-            finally:
-                self._busy = False
+        finally:
+            self._busy = False
         return self._peer
 
     @property
@@ -875,7 +920,7 @@ class Batch:
                 # left running by gather()): connecting now would be outside
                 # the lock, beside whatever holds it.
                 raise RuntimeError("Batch used after its batch() block exited")
-            self._conn = await t._connect(verify=self._verify)
+            self._conn = await t._connect(verify=self._verify, deadline=self._deadline)
             self._peer = t.peer
         conn = self._conn
         host = _host_header(t.host, t.port)

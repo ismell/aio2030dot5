@@ -10,6 +10,7 @@ become ``None`` rather than errors, because real agents omit fields freely
 from __future__ import annotations
 
 import enum
+import itertools
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator, Mapping
@@ -699,38 +700,43 @@ class HourlyEnergy:
 
     @property
     def complete(self) -> bool:
-        return self.covered >= 3600
+        return self.covered == 3600
 
 
 def hourly_energy(values: Iterable[IntervalValue], *, complete_only: bool = True) -> list[HourlyEnergy]:
     """Sum interval energy into clock hours (UTC), oldest first -- the shape
-    long-term statistics want. Each interval counts toward the hour it
-    starts in (2030.5 intervals are aligned, so they never straddle one).
-    Intervals without a value or flagged questionable are left out, which
-    makes their hour incomplete; ``complete_only`` drops such hours.
-    Duplicate intervals (same start) count once.
+    long-term statistics want.
+
+    Every interval must lie within one clock hour (2030.5 intervals are
+    aligned; 15 minutes on an Itron) and share one unit; overlapping
+    intervals are an error. Exact duplicates count once. Intervals without a
+    value or flagged questionable are left out, which leaves their hour
+    incomplete; ``complete_only`` drops such hours. Raises ``ValueError``.
     """
-    hours: dict[datetime, tuple[float, str, int, bool]] = {}
-    seen: set[datetime] = set()
-    for v in sorted(values, key=lambda v: v.start):
-        if v.value is None or v.start in seen:
+    unit: str | None = None
+    by_hour: dict[datetime, dict[tuple[datetime, datetime], IntervalValue]] = {}
+    for v in values:
+        if v.value is None or (v.quality is not None and v.quality & QualityFlags.QUESTIONABLE):
             continue
-        if v.quality is not None and v.quality & QualityFlags.QUESTIONABLE:
-            continue
-        seen.add(v.start)
-        start = v.start.astimezone(UTC)
-        hour = start.replace(minute=0, second=0, microsecond=0)
-        total, unit, covered, estimated = hours.get(hour, (0.0, v.unit, 0, False))
-        if unit != v.unit:
+        if unit is None:
+            unit = v.unit
+        elif v.unit != unit:
             raise ValueError(f"intervals mix units: {unit} and {v.unit}")
-        seconds = int((v.end - v.start).total_seconds())
-        hours[hour] = (
-            total + v.value,
-            unit,
-            covered + seconds,
-            estimated or bool(v.quality is not None and v.quality.is_estimated),
-        )
-    out = [HourlyEnergy(h, round(t, 9), u, c, e) for h, (t, u, c, e) in sorted(hours.items())]
+        start, end = v.start.astimezone(UTC), v.end.astimezone(UTC)
+        hour = start.replace(minute=0, second=0, microsecond=0)
+        if end <= start or end > hour + timedelta(hours=1):
+            raise ValueError(f"interval {start:%Y-%m-%d %H:%M}-{end:%H:%M} is not within one clock hour")
+        by_hour.setdefault(hour, {}).setdefault((start, end), v)
+    out = []
+    for hour, intervals in sorted(by_hour.items()):
+        spans = sorted(intervals)
+        for (_, prev_end), (next_start, _) in itertools.pairwise(spans):
+            if next_start < prev_end:
+                raise ValueError(f"overlapping intervals in the hour from {hour:%Y-%m-%d %H:%M} UTC")
+        total = sum(v.value or 0.0 for v in intervals.values())
+        covered = sum(int((e - s_).total_seconds()) for s_, e in spans)
+        estimated = any(v.quality is not None and v.quality.is_estimated for v in intervals.values())
+        out.append(HourlyEnergy(hour, round(total, 9), unit or "", covered, estimated))
     return [h for h in out if h.complete] if complete_only else out
 
 

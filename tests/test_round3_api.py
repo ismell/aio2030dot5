@@ -84,9 +84,11 @@ def test_a_broken_stored_identity_is_invalid_identity(data: Any) -> None:
         Identity.from_dict(data)
 
 
-def test_non_ascii_pem_bytes_are_invalid_identity(pki: Pki) -> None:
+def test_non_ascii_pem_text_is_invalid_and_junk_bytes_are_not_kept(pki: Pki) -> None:
     with pytest.raises(InvalidIdentity):
-        load_identity(pki.client_cert.read_bytes() + "é".encode(), pki.client_key.read_bytes())
+        load_identity(pki.client_cert.read_text() + "é", pki.client_key.read_text())
+    ident = load_identity(pki.client_cert.read_bytes() + "é".encode(), pki.client_key.read_bytes())
+    assert ident.cert_pem == pki.client_cert.read_text()  # stored as a canonical re-encoding
 
 
 def test_tls_context_from_pem_leaves_no_files(
