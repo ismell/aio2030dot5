@@ -19,10 +19,13 @@ from .exceptions import (
     MeterTimeout,
     ProfileError,
 )
+from .guard import ReadingGuard
 from .identity import (
     Identity,
     IdentityCheck,
+    canonical_sfdi,
     check_identity,
+    format_lfdi,
     generate_identity,
     lfdi_from_der,
     lfdi_from_pem,
@@ -41,6 +44,7 @@ from .models import (
     TouRegister,
     Uom,
     hourly_energy,
+    manufacturer_name,
 )
 from .profile import Channel, Direction, MeterInfo, MeterProfile, Quantity, Statistic
 from .transport import (
@@ -86,6 +90,7 @@ __all__ = [
     "ProfileError",
     "QualityFlags",
     "Quantity",
+    "ReadingGuard",
     "ReadingSetInfo",
     "ReadingType",
     "Statistic",
@@ -96,13 +101,16 @@ __all__ = [
     "async_build_ssl_context",
     "build_ssl_context",
     "build_ssl_context_from_pem",
+    "canonical_sfdi",
     "check_identity",
+    "format_lfdi",
     "generate_identity",
     "hourly_energy",
     "is_valid_sfdi",
     "lfdi_from_der",
     "lfdi_from_pem",
     "load_identity",
+    "manufacturer_name",
     "parse_advertisement",
     "sfdi_from_lfdi",
 ]

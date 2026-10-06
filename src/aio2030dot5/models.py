@@ -759,3 +759,12 @@ def _sfdi(value: str | None) -> str | None:
     if not value.strip().isascii() or not value.strip().isdigit():
         raise MeterProtocolError(f"sFDI is not a number: {value!r}")
     return str(int(value))  # agents may zero-pad it
+
+
+# DeviceInformation.mfID is the vendor's IANA Private Enterprise Number.
+MANUFACTURERS: dict[int, str] = {1233: "Itron"}
+
+
+def manufacturer_name(manufacturer_id: int | None) -> str | None:
+    """The vendor behind an mfID, when known."""
+    return MANUFACTURERS.get(manufacturer_id) if manufacturer_id is not None else None

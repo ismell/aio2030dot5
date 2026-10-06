@@ -19,9 +19,11 @@ Measured on agent 3.2.50: keep-alive honoured, idle connections closed after
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
+import socket
 import ssl
 import tempfile
 import time
@@ -620,15 +622,36 @@ _SHARED: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, in
 _SHARED_STRONG: dict[int, dict[tuple[str, int], _Shared]] = {}  # loops that refuse weak references
 
 
-def _shared(host: str, port: int) -> _Shared:
-    """The state for one meter address. Keyed by the host string as given:
-    use one canonical host (e.g. the IP) for every Meter of one meter."""
+def _shared(address: str, port: int) -> _Shared:
+    """The state for one meter, keyed by its (resolved) address and port."""
     loop = asyncio.get_running_loop()
     try:
         per_loop = _SHARED.setdefault(loop, {})
     except TypeError:
         per_loop = _SHARED_STRONG.setdefault(id(loop), {})
-    return per_loop.setdefault((host.lower(), port), _Shared())
+    return per_loop.setdefault((address.lower(), port), _Shared())
+
+
+# How long a resolved host name is trusted for keying the shared state.
+_RESOLVE_TTL = 300.0
+
+
+async def _canonical_address(host: str, port: int, resolve_within: float) -> str:
+    """One meter, one key: the same meter reached as "meter.local",
+    "192.0.2.19" or "[fe80::1%eth0]" must share one lock and one pacing
+    clock, or two connections could open at once. IP literals are
+    normalised; names are resolved (IPv4 preferred). If resolution fails the
+    name itself is the key -- connecting would fail the same way."""
+    bare = host.strip("[]").split("%", 1)[0]
+    with suppress(ValueError):
+        return ipaddress.ip_address(bare).compressed
+    try:
+        async with asyncio.timeout(resolve_within):
+            infos = await asyncio.get_running_loop().getaddrinfo(bare, port, type=socket.SOCK_STREAM)
+        infos.sort(key=lambda info: info[0] != socket.AF_INET)
+        return ipaddress.ip_address(str(infos[0][4][0]).split("%", 1)[0]).compressed
+    except (OSError, TimeoutError, ValueError, IndexError):
+        return bare.lower()
 
 
 class MeterTransport:
@@ -657,6 +680,7 @@ class MeterTransport:
         self.expected_lfdi = expected_lfdi
         # The certificate from the latest handshake -- also a refused one.
         self.peer: PeerCertificate | None = None
+        self._address: tuple[str, str, float] | None = None  # (host, resolved, when)
         self.timeouts = timeouts or Timeouts()
         self.min_connect_interval = min_connect_interval
         self.request_spacing = request_spacing
@@ -665,7 +689,19 @@ class MeterTransport:
 
     @property
     def _lock(self) -> asyncio.Lock:
-        return _shared(self.host, self.port).lock
+        return self._state().lock
+
+    def _state(self) -> _Shared:
+        """The shared state of this meter (by the last resolved address)."""
+        address = self._address[1] if self._address and self._address[0] == self.host else self.host
+        return _shared(address, self.port)
+
+    async def _resolve(self) -> _Shared:
+        now = time.monotonic()
+        if self._address is None or self._address[0] != self.host or now - self._address[2] > _RESOLVE_TTL:
+            resolved = await _canonical_address(self.host, self.port, self.timeouts.connect)
+            self._address = (self.host, resolved, now)
+        return self._state()
 
     @property
     def expected_lfdi(self) -> str | None:
@@ -684,7 +720,7 @@ class MeterTransport:
         self._session = None
 
     async def _connect(self, *, verify: bool = True, deadline: asyncio.Timeout | None = None) -> _TlsConnection:
-        shared = _shared(self.host, self.port)
+        shared = self._state()
         task = asyncio.current_task()
         if shared.owner is not None and task is not None and shared.owner is not task:
             raise RuntimeError("a Batch must be used from the task that opened it")
@@ -783,7 +819,7 @@ class MeterTransport:
         other Meter object) from inside one raises RuntimeError instead of
         waiting forever on the lock.
         """
-        shared = _shared(self.host, self.port)
+        shared = await self._resolve()
         task = asyncio.current_task()
         if task is not None and shared.owner is task:
             raise RuntimeError(f"nested batch on {self.host}:{self.port} would deadlock")
@@ -958,13 +994,13 @@ class Batch:
             try:
                 await conn.close()
             finally:
-                _shared(self._t.host, self._t.port).last_close = time.monotonic()
+                self._t._state().last_close = time.monotonic()
 
     def _kill(self) -> None:
         if self._conn is not None:
             conn, self._conn = self._conn, None
             conn.abort()
-            _shared(self._t.host, self._t.port).last_close = time.monotonic()
+            self._t._state().last_close = time.monotonic()
 
 
 # Reconnect instead of reusing a connection idle this long (the meter closes

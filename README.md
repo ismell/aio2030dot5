@@ -32,8 +32,8 @@ This library is designed around that:
 
   One call can take a while on a struggling meter: pacing, connect, a handshake retry and the response add up to
   about 3 minutes with the default timeouts. Wrap calls in your own deadline if you need one.
-- **One meter, one lock.** Every `Meter` object for the same `(host, port)` on an event loop shares a lock and
-  connection pacing. Use one canonical host string per meter. Batches are not re-entrant: starting one from inside
+- **One meter, one lock.** Every `Meter` object for the same meter on an event loop shares a lock and connection pacing,
+  keyed by resolved address and port. "meter.local" and its IP are one meter. Batches are not re-entrant: starting one from inside
   another raises `RuntimeError` rather than deadlocking.
 - **Discovery by meaning, not by path.** Each MeterReading is classified from its ReadingType
   (quantity, statistic, direction, phase), with its description breaking ties older agents leave. Callers ask for
@@ -109,6 +109,8 @@ if peer.client_accepted:
 - **`Timeouts(batch=…)`** is a per-call deadline. It starts once the meter's lock is held, so time spent queued behind
   another reader never counts against it.
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
+- **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
+  faster than the service allows. It rebases on consistent new series, and records register resets in `.resets`.
 - **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
 - **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, `MeterInfo` and `Identity`, for test
   fixtures and diagnostics.

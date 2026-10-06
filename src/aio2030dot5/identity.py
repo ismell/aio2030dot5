@@ -48,6 +48,11 @@ def sfdi_from_lfdi(lfdi: str) -> str:
     return f"{digits}{check}"
 
 
+def format_lfdi(lfdi: str) -> str:
+    """An LFDI as utility portals show it: groups of four hex digits."""
+    return "-".join(lfdi[i : i + 4] for i in range(0, len(lfdi), 4))
+
+
 def canonical_sfdi(sfdi: str | int) -> str:
     """An SFDI in one lexical form. It is an integer (UInt40): agents may
     zero-pad it ("060044366894"), so compare canonical forms only."""
