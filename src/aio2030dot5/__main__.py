@@ -71,7 +71,8 @@ async def _run(args: argparse.Namespace) -> int:
             for key, tiers in snap.tou.items():
                 for tier, m in sorted(tiers.items()):
                     print(f"{key + '[tier ' + str(tier) + ']':40} {m.value!s:>14} {m.unit}")
-            print(f"{'clock_skew':40} {snap.clock_skew}")
+            if snap.clock_skew is not None:
+                print(f"{'clock_skew':40} {snap.clock_skew.total_seconds():+14.1f} s")
         elif args.cmd == "intervals":
             ch = next((c for c in profile.channels if c.key == args.channel), None)
             if ch is None or ch.statistic != Statistic.INTERVAL:
