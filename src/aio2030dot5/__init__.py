@@ -5,6 +5,7 @@ deploys with local "Launchpad" access, but nothing here is Xcel-specific.
 """
 
 from .client import Meter, MeterSnapshot
+from .dnssd import Advertisement, is_valid_sfdi, parse_advertisement
 from .exceptions import (
     InvalidIdentity,
     MeterAuthError,
@@ -25,6 +26,7 @@ from .transport import Timeouts, TransportStats, build_ssl_context
 __version__ = "0.1.0"
 
 __all__ = [
+    "Advertisement",
     "Channel",
     "Direction",
     "IntervalValue",
@@ -52,7 +54,9 @@ __all__ = [
     "TransportStats",
     "Uom",
     "build_ssl_context",
+    "is_valid_sfdi",
     "lfdi_from_der",
     "lfdi_from_pem",
+    "parse_advertisement",
     "sfdi_from_lfdi",
 ]
