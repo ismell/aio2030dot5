@@ -49,8 +49,10 @@ def sfdi_from_lfdi(lfdi: str) -> str:
 
 
 def format_lfdi(lfdi: str) -> str:
-    """An LFDI as utility portals show it: groups of four hex digits."""
-    return "-".join(lfdi[i : i + 4] for i in range(0, len(lfdi), 4))
+    """An LFDI for a person to read and register: eight groups of five hex
+    digits. Xcel Energy's portal accepts only this grouping, or none."""
+    lfdi = lfdi.replace("-", "").upper()
+    return "-".join(lfdi[i : i + 5] for i in range(0, len(lfdi), 5))
 
 
 def canonical_sfdi(sfdi: str | int) -> str:

@@ -122,10 +122,11 @@ async def test_an_unresolvable_name_is_its_own_key(pki: Pki) -> None:
 # -- helpers ---------------------------------------------------------------------------
 
 
-def test_lfdi_as_portals_show_it() -> None:
-    assert format_lfdi("F289A6F0493D756E057A2B5B59538112697B5A15") == (
-        "F289-A6F0-493D-756E-057A-2B5B-5953-8112-697B-5A15"
-    )
+def test_lfdi_as_utility_portals_accept_it() -> None:
+    """Xcel Energy takes groups of five, or no dashes at all."""
+    expected = "431ED-86C1F-202CD-D3FEB-3EF8D-CB9F4-457F0-EC47D"
+    assert format_lfdi("431ED86C1F202CDD3FEB3EF8DCB9F4457F0EC47D") == expected
+    assert format_lfdi("431e-d86c-1f20-2cdd-3feb-3ef8-dcb9-f445-7f0e-c47d") == expected
 
 
 def test_manufacturers() -> None:
