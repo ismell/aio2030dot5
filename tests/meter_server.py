@@ -97,6 +97,7 @@ class FakeMeter:
         blackhole: bool = False,
         honour_keep_alive: bool = True,
         clean_close: bool = True,
+        port: int = 0,
         tree: FixtureTree | None = None,
     ) -> None:
         self.tree = tree or FixtureTree()
@@ -119,7 +120,7 @@ class FakeMeter:
         self.ctx = ctx
         self._sock = socket.socket()
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", 0))
+        self._sock.bind(("127.0.0.1", port))
         self._sock.listen(8)
         self.port = self._sock.getsockname()[1]
         self._stop = threading.Event()
