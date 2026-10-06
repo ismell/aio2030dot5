@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aio2030dot5"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Async client for IEEE 2030.5 (SEP 2.0) HAN smart meters, e.g. Itron Gen5 Riva (Xcel Energy Launchpad)"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["cryptography>=43"]
 classifiers = [
   "Framework :: AsyncIO",
   "Programming Language :: Python :: 3",
@@ -18,8 +18,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-identity = ["cryptography>=43"]
 zeroconf = ["zeroconf>=0.130"]
+
+[tool.hatch.version]
+path = "src/aio2030dot5/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aio2030dot5"]

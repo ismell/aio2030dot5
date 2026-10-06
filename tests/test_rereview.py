@@ -247,7 +247,7 @@ def test_a_self_signature_that_does_not_verify_is_reported() -> None:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    good = x509.load_pem_x509_certificate(generate_identity().cert_pem)
+    good = x509.load_pem_x509_certificate(generate_identity().cert_pem.encode())
     other_key = ec.generate_private_key(ec.SECP256R1())
     forged = (
         x509.CertificateBuilder()

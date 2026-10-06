@@ -44,8 +44,8 @@ async def _run(args: argparse.Namespace) -> int:
             ident = generate_identity()
             key_path = Path(args.key)
             key_path.touch(mode=0o600, exist_ok=False)
-            key_path.write_bytes(ident.key_pem)
-            Path(args.cert).write_bytes(ident.cert_pem)
+            key_path.write_text(ident.key_pem)
+            Path(args.cert).write_text(ident.cert_pem)
         check = check_identity(Path(args.cert).read_bytes(), Path(args.key).read_bytes())
         print(
             f"LFDI       {check.lfdi}\nSFDI       {check.sfdi}\nexpires    {check.not_after:%Y-%m-%d} "

@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from .exceptions import MeterProtocolError, ProfileError
+from .identity import sfdi_from_lfdi
 from .models import (
     Accumulation,
     DataQualifier,
@@ -439,22 +440,48 @@ def _rank_usage_point(p: UsagePoint) -> tuple[int, int, int, int]:
 # -- discovery ----------------------------------------------------------------
 
 
-async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dcap") -> MeterProfile:
-    """Walk the meter's resource tree. ``dcap_path`` comes from the DNS-SD
-    TXT record ``dcap`` when the meter was found by mDNS."""
+@dataclass(frozen=True, slots=True)
+class MeterInfo:
+    """Who the meter says it is (DeviceCapability, SelfDevice and
+    DeviceInformation), and the identity its certificate proves."""
+
+    lfdi: str | None  # as the meter reports it
+    sfdi: str | None
+    certificate_lfdi: str | None  # SHA-256 of its TLS certificate: the one to trust
+    manufacturer_id: int | None
+    model: str | None
+    serial_number: str | None
+    hardware_version: str | None
+    software_version: str | None
+    dcap_path: str
+    time_href: str | None = None
+    usage_point_list_href: str | None = None
+    device_information_href: str | None = None
+
+    @property
+    def certificate_sfdi(self) -> str | None:
+        return sfdi_from_lfdi(self.certificate_lfdi) if self.certificate_lfdi else None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {f: getattr(self, f) for f in self.__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> MeterInfo:
+        fields: dict[str, Any] = {f: d.get(f) for f in cls.__dataclass_fields__}
+        fields["dcap_path"] = fields["dcap_path"] or "/dcap"
+        return cls(**fields)
+
+
+async def read_meter_info(batch: Batch, host: str, port: int, *, dcap_path: str = "/dcap") -> MeterInfo:
+    """DeviceCapability, SelfDevice and DeviceInformation: 1-3 GETs."""
 
     def resolve(base: str, href: str) -> str:
         return resolve_href(base, href, host, port)
 
     dcap_path = resolve("/", dcap_path)
     dcap = DeviceCapability.from_xml(parse_xml(await batch.get(dcap_path)))
-    if not dcap.usage_point_list_href:
-        raise MeterProtocolError("DeviceCapability has no UsagePointListLink")
-    upt_href = resolve(dcap_path, dcap.usage_point_list_href)
-    time_href = resolve(dcap_path, dcap.time_href) if dcap.time_href else None
-
-    lfdi = sfdi = sw = info_href = None
-    mfid = None
+    lfdi = sfdi = info_href = None
+    info: DeviceInformation | None = None
     if dcap.self_device_href:
         sdev_href = resolve(dcap_path, dcap.self_device_href)
         sdev = SelfDevice.from_xml(parse_xml(await batch.get(sdev_href)))
@@ -463,7 +490,41 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
             info_href = resolve(sdev_href, sdev.device_information_href)
             info = DeviceInformation.from_xml(parse_xml(await batch.get(info_href)))
             lfdi = info.lfdi or lfdi
-            sw, mfid = info.software_version, info.manufacturer_id
+    return MeterInfo(
+        lfdi=lfdi.upper() if lfdi else None,
+        sfdi=sfdi,
+        certificate_lfdi=batch.peer.lfdi if batch.peer else None,
+        manufacturer_id=info.manufacturer_id if info else None,
+        model=(info.model or None) if info else None,
+        serial_number=(info.serial_number or None) if info else None,
+        hardware_version=(info.hardware_version or None) if info else None,
+        software_version=info.software_version if info else None,
+        dcap_path=dcap_path,
+        time_href=resolve(dcap_path, dcap.time_href) if dcap.time_href else None,
+        usage_point_list_href=resolve(dcap_path, dcap.usage_point_list_href) if dcap.usage_point_list_href else None,
+        device_information_href=info_href,
+    )
+
+
+async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dcap") -> MeterProfile:
+    """Walk the meter's resource tree. ``dcap_path`` comes from the DNS-SD
+    TXT record ``dcap`` when the meter was found by mDNS."""
+
+    def resolve(base: str, href: str) -> str:
+        return resolve_href(base, href, host, port)
+
+    meter = await read_meter_info(batch, host, port, dcap_path=dcap_path)
+    if not meter.usage_point_list_href:
+        raise MeterProtocolError("DeviceCapability has no UsagePointListLink")
+    upt_href = meter.usage_point_list_href
+    time_href = meter.time_href
+    lfdi, sfdi, sw, mfid, info_href = (
+        meter.lfdi,
+        meter.sfdi,
+        meter.software_version,
+        meter.manufacturer_id,
+        meter.device_information_href,
+    )
 
     page, upt_elems = await get_list(batch, upt_href, "UsagePoint")
     points = sorted((UsagePoint.from_xml(e) for e in upt_elems), key=_rank_usage_point)
@@ -524,7 +585,7 @@ async def discover(batch: Batch, host: str, port: int, *, dcap_path: str = "/dca
     return MeterProfile(
         host=host,
         port=port,
-        meter_lfdi=lfdi.upper() if lfdi else None,
+        meter_lfdi=lfdi,
         meter_sfdi=sfdi,
         manufacturer_id=mfid,
         software_version=sw,

@@ -1,11 +1,11 @@
-"""Async client for IEEE 2030.5 (SEP 2.0) HAN smart meters.
+"""Async client for IEEE 2030.5 (SEP 2.0) HAN meters.
 
 Built for, and tested against, the Itron Gen5 Riva meters Xcel Energy
 deploys with local "Launchpad" access, but nothing here is Xcel-specific.
 """
 
-from .client import Meter, MeterSnapshot, PeerInfo
-from .dnssd import Advertisement, is_valid_sfdi, parse_advertisement
+from .client import REDACT_KEYS, Meter, MeterSnapshot, PeerInfo
+from .dnssd import SERVICE_TYPE, Advertisement, is_valid_sfdi, parse_advertisement
 from .exceptions import (
     InvalidIdentity,
     MeterAuthError,
@@ -19,17 +19,51 @@ from .exceptions import (
     MeterTimeout,
     ProfileError,
 )
-from .identity import lfdi_from_der, lfdi_from_pem, sfdi_from_lfdi
-from .models import IntervalValue, Measurement, MeterTime, QualityFlags, ReadingSetInfo, ReadingType, Uom
-from .profile import Channel, Direction, MeterProfile, Quantity, Statistic
-from .transport import PeerCertificate, Timeouts, TransportStats, build_ssl_context
+from .identity import (
+    Identity,
+    IdentityCheck,
+    check_identity,
+    generate_identity,
+    lfdi_from_der,
+    lfdi_from_pem,
+    load_identity,
+    sfdi_from_lfdi,
+)
+from .models import (
+    DeviceInformation,
+    HourlyEnergy,
+    IntervalValue,
+    Measurement,
+    MeterTime,
+    QualityFlags,
+    ReadingSetInfo,
+    ReadingType,
+    TouRegister,
+    Uom,
+    hourly_energy,
+)
+from .profile import Channel, Direction, MeterInfo, MeterProfile, Quantity, Statistic
+from .transport import (
+    PeerCertificate,
+    Timeouts,
+    TransportStats,
+    async_build_ssl_context,
+    build_ssl_context,
+    build_ssl_context_from_pem,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "REDACT_KEYS",
+    "SERVICE_TYPE",
     "Advertisement",
     "Channel",
+    "DeviceInformation",
     "Direction",
+    "HourlyEnergy",
+    "Identity",
+    "IdentityCheck",
     "IntervalValue",
     "InvalidIdentity",
     "Measurement",
@@ -40,6 +74,7 @@ __all__ = [
     "MeterError",
     "MeterHttpError",
     "MeterIdentityMismatch",
+    "MeterInfo",
     "MeterNotFound",
     "MeterProfile",
     "MeterProtocolError",
@@ -55,12 +90,19 @@ __all__ = [
     "ReadingType",
     "Statistic",
     "Timeouts",
+    "TouRegister",
     "TransportStats",
     "Uom",
+    "async_build_ssl_context",
     "build_ssl_context",
+    "build_ssl_context_from_pem",
+    "check_identity",
+    "generate_identity",
+    "hourly_energy",
     "is_valid_sfdi",
     "lfdi_from_der",
     "lfdi_from_pem",
+    "load_identity",
     "parse_advertisement",
     "sfdi_from_lfdi",
 ]

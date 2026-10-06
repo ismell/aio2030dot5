@@ -90,10 +90,33 @@ python -m aio2030dot5 identity --cert cert.pem --key key.pem [--generate]   # LF
 python -m aio2030dot5 read --host 192.0.2.19 --cert cert.pem --key key.pem --profile profile.json
 ```
 
+## For a Home Assistant integration
+
+Everything a config flow and coordinator need, without files:
+
+```python
+from aio2030dot5 import Identity, Meter, MeterAuthError, generate_identity, load_identity, REDACT_KEYS
+
+identity = await hass.async_add_executor_job(generate_identity)  # or load_identity(cert, key) from a form
+entry_data = {"identity": identity.to_dict(), "sfdi": adv.sfdi}  # secret: redact with REDACT_KEYS
+
+meter = await Meter.create(host, Identity.from_dict(entry_data["identity"]), dcap_path=adv.dcap_path)
+peer = await meter.probe_tls()          # who is there, even before registration
+if peer.client_accepted:
+    info = await meter.probe()          # 1-3 GETs: lFDI/sFDI, manufacturer, software version
+```
+
+- **`Timeouts(batch=…)`** is a per-call deadline. It starts once the meter's lock is held, so time spent queued behind
+  another reader never counts against it.
+- **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
+- **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
+- **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, `MeterInfo` and `Identity`, for test
+  fixtures and diagnostics.
+
 ## Client identity
 
 The meter admits a client whose self-signed certificate's **LFDI** has been registered with the utility.
-`aio2030dot5.identity` (needs the `identity` extra, i.e. `cryptography`) can:
+`aio2030dot5.identity` can:
 - generate a certificate in the profile an Itron meter accepts;
 - compute the LFDI and SFDI;
 - validate a certificate/key pair.
@@ -107,5 +130,5 @@ anonymised), served by a fake meter that speaks the same TLS profile and models 
 paging and session resumption.
 
 ```
-pip install -e '.[identity,zeroconf]' pytest pytest-asyncio && pytest
+pip install -e '.[zeroconf]' pytest pytest-asyncio && pytest
 ```

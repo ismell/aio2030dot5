@@ -12,8 +12,10 @@ from __future__ import annotations
 import enum
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from .exceptions import MeterProtocolError
 
@@ -258,6 +260,21 @@ class MeterTime:
             dst_offset=int_or_none(root, "dstOffset") or 0,
             quality=int_or_none(root, "quality"),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "current_time": _iso(self.current_time),
+            "tz_offset": self.tz_offset,
+            "dst_offset": self.dst_offset,
+            "quality": self.quality,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> MeterTime:
+        current = _from_iso(d["current_time"])
+        if current is None:
+            raise ValueError("current_time is required")
+        return cls(current, d.get("tz_offset", 0), d.get("dst_offset", 0), d.get("quality"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +539,30 @@ class Measurement:
             quality=reading.quality,
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe (e.g. for test fixtures or diagnostics)."""
+        return {
+            "value": self.value,
+            "unit": self.unit,
+            "start": _iso(self.start),
+            "duration": self.duration,
+            "tou_tier": self.tou_tier,
+            "uom": self.uom,
+            "quality": None if self.quality is None else int(self.quality),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> Measurement:
+        return cls(
+            value=d["value"],
+            unit=d["unit"],
+            start=_from_iso(d.get("start")),
+            duration=d.get("duration"),
+            tou_tier=d.get("tou_tier"),
+            uom=d.get("uom", 0),
+            quality=None if d.get("quality") is None else QualityFlags(d["quality"]),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class IntervalValue:
@@ -533,6 +574,30 @@ class IntervalValue:
     unit: str
     uom: int = 0
     quality: QualityFlags | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start": _iso(self.start),
+            "end": _iso(self.end),
+            "value": self.value,
+            "unit": self.unit,
+            "uom": self.uom,
+            "quality": None if self.quality is None else int(self.quality),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> IntervalValue:
+        start, end = _from_iso(d["start"]), _from_iso(d["end"])
+        if start is None or end is None:
+            raise ValueError("an interval needs a start and an end")
+        return cls(
+            start=start,
+            end=end,
+            value=d["value"],
+            unit=d["unit"],
+            uom=d.get("uom", 0),
+            quality=None if d.get("quality") is None else QualityFlags(d["quality"]),
+        )
 
 
 def interval_values(
@@ -575,3 +640,108 @@ def interval_values(
         )
     out.sort(key=lambda v: v.start)
     return out
+
+
+class TouRegister(Mapping[int, Measurement]):
+    """A time-of-use summation register: ``{tier: Measurement}``.
+
+    Tier 0 is the register's total; tiers 1..n are the rate periods (which
+    period a tier is, the meter does not say). Behaves as a read-only dict.
+    """
+
+    __slots__ = ("_tiers",)
+
+    def __init__(self, tiers: Mapping[int, Measurement]) -> None:
+        self._tiers = dict(sorted(tiers.items()))
+
+    def __getitem__(self, tier: int) -> Measurement:
+        return self._tiers[tier]
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._tiers)
+
+    def __len__(self) -> int:
+        return len(self._tiers)
+
+    def __repr__(self) -> str:
+        return f"TouRegister({self._tiers!r})"
+
+    @property
+    def total(self) -> Measurement | None:
+        return self._tiers.get(0)
+
+    @property
+    def tiers(self) -> dict[int, Measurement]:
+        """The rate-period tiers (1..n) that hold a value."""
+        return {t: m for t, m in self._tiers.items() if t > 0 and m.value is not None}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {str(t): m.to_dict() for t, m in self._tiers.items()}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> TouRegister:
+        return cls({int(t): Measurement.from_dict(m) for t, m in d.items()})
+
+
+@dataclass(frozen=True, slots=True)
+class HourlyEnergy:
+    """The energy of one clock hour (UTC), summed from intervals."""
+
+    start: datetime
+    value: float
+    unit: str
+    covered: int  # seconds of the hour that intervals covered (3600 when complete)
+    estimated: bool  # any interval flagged estimated by the meter
+
+    @property
+    def end(self) -> datetime:
+        return self.start + timedelta(hours=1)
+
+    @property
+    def complete(self) -> bool:
+        return self.covered >= 3600
+
+
+def hourly_energy(values: Iterable[IntervalValue], *, complete_only: bool = True) -> list[HourlyEnergy]:
+    """Sum interval energy into clock hours (UTC), oldest first -- the shape
+    long-term statistics want. Each interval counts toward the hour it
+    starts in (2030.5 intervals are aligned, so they never straddle one).
+    Intervals without a value or flagged questionable are left out, which
+    makes their hour incomplete; ``complete_only`` drops such hours.
+    Duplicate intervals (same start) count once.
+    """
+    hours: dict[datetime, tuple[float, str, int, bool]] = {}
+    seen: set[datetime] = set()
+    for v in sorted(values, key=lambda v: v.start):
+        if v.value is None or v.start in seen:
+            continue
+        if v.quality is not None and v.quality & QualityFlags.QUESTIONABLE:
+            continue
+        seen.add(v.start)
+        start = v.start.astimezone(UTC)
+        hour = start.replace(minute=0, second=0, microsecond=0)
+        total, unit, covered, estimated = hours.get(hour, (0.0, v.unit, 0, False))
+        if unit != v.unit:
+            raise ValueError(f"intervals mix units: {unit} and {v.unit}")
+        seconds = int((v.end - v.start).total_seconds())
+        hours[hour] = (
+            total + v.value,
+            unit,
+            covered + seconds,
+            estimated or bool(v.quality is not None and v.quality.is_estimated),
+        )
+    out = [HourlyEnergy(h, round(t, 9), u, c, e) for h, (t, u, c, e) in sorted(hours.items())]
+    return [h for h in out if h.complete] if complete_only else out
+
+
+def _iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _from_iso(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp without a timezone: {value!r}")
+    return parsed

@@ -57,8 +57,8 @@ def pki(tmp_path_factory: pytest.TempPathFactory) -> Pki:
     for name in ("client", "other"):
         ident = generate_identity()
         c, k = d / f"{name}.pem", d / f"{name}.key"
-        c.write_bytes(ident.cert_pem)
-        k.write_bytes(ident.key_pem)
+        c.write_text(ident.cert_pem)
+        k.write_text(ident.key_pem)
         paths += [c, k]
     return Pki(sc, sk, *paths)
 

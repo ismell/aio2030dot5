@@ -14,8 +14,10 @@ import ssl
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from .exceptions import MeterAuthError, MeterNotFound, MeterProtocolError, ProfileError
+from .identity import Identity
 from .models import (
     DeviceInformation,
     IntervalValue,
@@ -23,13 +25,42 @@ from .models import (
     MeterTime,
     Reading,
     ReadingSetInfo,
+    TouRegister,
+    _from_iso,
+    _iso,
     interval_values,
     parse_xml,
 )
-from .profile import Channel, MeterProfile, Statistic, discover, get_list, resolve_href
-from .transport import Batch, MeterTransport, PeerCertificate, Timeouts, TransportStats, build_ssl_context
+from .profile import Channel, MeterInfo, MeterProfile, Statistic, discover, get_list, read_meter_info, resolve_href
+from .transport import (
+    Batch,
+    MeterTransport,
+    PeerCertificate,
+    Timeouts,
+    TransportStats,
+    async_build_ssl_context,
+    build_ssl_context,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Keys in this library's to_dict() output (and in Identity.to_dict()) that
+# identify the meter, its owner's premises or a secret. For Home Assistant
+# diagnostics: async_redact_data(data, REDACT_KEYS).
+REDACT_KEYS = frozenset(
+    {
+        "cert_pem",
+        "key_pem",
+        "lfdi",
+        "sfdi",
+        "meter_lfdi",
+        "meter_sfdi",
+        "certificate_lfdi",
+        "serial_number",
+        "mrid",
+        "host",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,8 +69,8 @@ class MeterSnapshot:
 
     fetched_at: datetime
     values: dict[str, Measurement] = field(default_factory=dict)
-    # ToU registers: channel key -> {tier: Measurement}. Tier 0 is the total.
-    tou: dict[str, dict[int, Measurement]] = field(default_factory=dict)
+    # ToU registers by channel key. Tier 0 is the total.
+    tou: dict[str, TouRegister] = field(default_factory=dict)
     meter_time: MeterTime | None = None
 
     @property
@@ -49,6 +80,27 @@ class MeterSnapshot:
             return None
         return self.meter_time.current_time - self.fetched_at
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, e.g. to record a fixture or for diagnostics."""
+        return {
+            "fetched_at": _iso(self.fetched_at),
+            "values": {k: m.to_dict() for k, m in self.values.items()},
+            "tou": {k: r.to_dict() for k, r in self.tou.items()},
+            "meter_time": self.meter_time.to_dict() if self.meter_time else None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> MeterSnapshot:
+        fetched_at = _from_iso(d["fetched_at"])
+        if fetched_at is None:
+            raise ValueError("fetched_at is required")
+        return cls(
+            fetched_at=fetched_at,
+            values={k: Measurement.from_dict(m) for k, m in d.get("values", {}).items()},
+            tou={k: TouRegister.from_dict(r) for k, r in d.get("tou", {}).items()},
+            meter_time=MeterTime.from_dict(d["meter_time"]) if d.get("meter_time") else None,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PeerInfo:
@@ -57,6 +109,14 @@ class PeerInfo:
     certificate: PeerCertificate  # .lfdi / .sfdi identify the meter
     client_accepted: bool  # the handshake completed with our certificate
     auth_reason: str | None = None  # MeterAuthError.reason when it did not
+
+    @property
+    def lfdi(self) -> str:
+        return self.certificate.lfdi
+
+    @property
+    def sfdi(self) -> str:
+        return self.certificate.sfdi
 
 
 class Meter:
@@ -84,9 +144,13 @@ class Meter:
         min_connect_interval: float = 2.0,
         request_spacing: float = 0.25,
         expected_lfdi: str | None = None,
+        dcap_path: str = "/dcap",
     ) -> None:
         self.host = host
         self.port = port
+        # Where discovery starts: the DNS-SD TXT record ``dcap`` when the
+        # meter was found by mDNS.
+        self.dcap_path = dcap_path
         self.transport = MeterTransport(
             host,
             port,
@@ -95,6 +159,34 @@ class Meter:
             min_connect_interval=min_connect_interval,
             request_spacing=request_spacing,
             expected_lfdi=expected_lfdi,
+        )
+
+    @classmethod
+    async def create(
+        cls,
+        host: str,
+        identity: Identity,
+        port: int = 8081,
+        *,
+        timeouts: Timeouts | None = None,
+        expected_lfdi: str | None = None,
+        dcap_path: str = "/dcap",
+        min_connect_interval: float = 2.0,
+        request_spacing: float = 0.25,
+    ) -> Meter:
+        """A Meter using ``identity`` (e.g. from a config entry). Builds the
+        TLS context off the event loop. ``expected_lfdi`` is the meter's
+        LFDI, if already known; otherwise the first discover() pins it."""
+        ctx = await async_build_ssl_context(identity)
+        return cls(
+            host,
+            ctx,
+            port,
+            timeouts=timeouts,
+            min_connect_interval=min_connect_interval,
+            request_spacing=request_spacing,
+            expected_lfdi=expected_lfdi,
+            dcap_path=dcap_path,
         )
 
     @classmethod
@@ -134,13 +226,20 @@ class Meter:
             raise MeterProtocolError(f"{self.host}:{self.port} presented no certificate")
         return PeerInfo(peer, client_accepted=True)
 
-    async def discover(self, *, dcap_path: str = "/dcap") -> MeterProfile:
-        """Walk the resource tree (~30 GETs, one connection). ``dcap_path``
-        comes from the DNS-SD TXT record ``dcap`` when the meter was found by
-        mDNS. Pins the meter (``expected_lfdi``) if nothing was pinned yet."""
+    async def probe(self) -> MeterInfo:
+        """Who the meter is, once our certificate is registered: 1-3 GETs on
+        one connection (DeviceCapability, SelfDevice, DeviceInformation).
+        Checks ``expected_lfdi`` like every call; does not pin."""
+        async with self.transport.batch() as b:
+            return await read_meter_info(b, self.host, self.port, dcap_path=self.dcap_path)
+
+    async def discover(self, *, dcap_path: str | None = None) -> MeterProfile:
+        """Walk the resource tree (~30 GETs, one connection), starting at
+        ``dcap_path`` (default: the Meter's). Pins the meter
+        (``expected_lfdi``) if nothing was pinned yet."""
         async with self.transport.batch() as b:
             peer = await b.connect()
-            profile = await discover(b, self.host, self.port, dcap_path=dcap_path)
+            profile = await discover(b, self.host, self.port, dcap_path=dcap_path or self.dcap_path)
         if peer is None:
             return profile
         if profile.meter_lfdi and profile.meter_lfdi.upper() != peer.lfdi:
@@ -179,7 +278,7 @@ class Meter:
         """
         self._pin(profile)
         values: dict[str, Measurement] = {}
-        tou: dict[str, dict[int, Measurement]] = {}
+        tou: dict[str, TouRegister] = {}
         meter_time = None
         async with self.transport.batch() as b:
             # Taken once the lock is ours, not while queued behind another batch.
@@ -277,7 +376,7 @@ def _require_interval(channel: Channel) -> str:
     return channel.reading_set_list_href
 
 
-async def _read_tou(b: Batch, ch: Channel) -> dict[int, Measurement]:
+async def _read_tou(b: Batch, ch: Channel) -> TouRegister:
     assert ch.tou_reading_list_href
     _, elems = await get_list(b, ch.tou_reading_list_href, "Reading")
     tiers: dict[int, Measurement] = {}
@@ -285,7 +384,7 @@ async def _read_tou(b: Batch, ch: Channel) -> dict[int, Measurement]:
         r = Reading.from_xml(e)
         if r.tou_tier is not None:
             tiers[r.tou_tier] = Measurement.of(r, ch.reading_type)
-    return tiers
+    return TouRegister(tiers)
 
 
 def _resolve_set(base: str, rs: ReadingSetInfo, host: str, port: int) -> ReadingSetInfo:
@@ -335,4 +434,4 @@ async def _read_sets(
     return out
 
 
-__all__ = ["Meter", "MeterSnapshot", "PeerInfo"]
+__all__ = ["REDACT_KEYS", "Meter", "MeterSnapshot", "PeerInfo"]

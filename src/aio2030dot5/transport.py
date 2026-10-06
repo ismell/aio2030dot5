@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import ssl
+import tempfile
 import time
 import weakref
 from collections.abc import AsyncIterator
@@ -39,7 +41,7 @@ from .exceptions import (
     MeterProtocolError,
     MeterTimeout,
 )
-from .identity import lfdi_from_der, sfdi_from_lfdi
+from .identity import Identity, lfdi_from_der, sfdi_from_lfdi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,7 +53,7 @@ _MAX_BODY_BYTES = 4 * 1024 * 1024
 
 
 def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
-    """TLS client context for an IEEE 2030.5 HAN meter.
+    """TLS client context for an IEEE 2030.5 HAN meter, from PEM files.
 
     Blocking (reads the cert and key files): call it from an executor in an
     event loop. The meter's certificate chains to its manufacturer's 2030.5
@@ -61,6 +63,40 @@ def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
     set by ``discover()``); it admits us because our certificate's LFDI is
     registered with the utility.
     """
+    ctx = _client_context()
+    ctx.load_cert_chain(cert_path, key_path)
+    return ctx
+
+
+def build_ssl_context_from_pem(cert_pem: str | bytes, key_pem: str | bytes) -> ssl.SSLContext:
+    """:func:`build_ssl_context` from PEM text, e.g. an identity kept in a
+    config entry. Blocking: call it from an executor.
+
+    Why temporary files: ``ssl.SSLContext.load_cert_chain`` only reads from
+    paths -- the ssl module has no way to load a private key from memory, and
+    there is no cross-platform anonymous file it can open. The PEMs go into a
+    fresh private directory (mode 0700, files 0600) that is removed before
+    this returns, so the key is on disk only for the duration of the call.
+    """
+    ctx = _client_context()
+    with tempfile.TemporaryDirectory(prefix="aio2030dot5-") as tmp:
+        paths = []
+        for name, pem in (("cert.pem", cert_pem), ("key.pem", key_pem)):
+            path = os.path.join(tmp, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem.encode("ascii") if isinstance(pem, str) else pem)
+            paths.append(path)
+        ctx.load_cert_chain(paths[0], paths[1])
+    return ctx
+
+
+async def async_build_ssl_context(identity: Identity) -> ssl.SSLContext:
+    """:func:`build_ssl_context_from_pem` for an :class:`Identity`, off the event loop."""
+    return await asyncio.to_thread(build_ssl_context_from_pem, identity.cert_pem, identity.key_pem)
+
+
+def _client_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -68,15 +104,20 @@ def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
     ctx.maximum_version = ssl.TLSVersion.TLSv1_2
     ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
     ctx.set_ciphers(IEEE_2030_5_CIPHERS)
-    ctx.load_cert_chain(cert_path, key_path)
     return ctx
 
 
 @dataclass(frozen=True, slots=True)
 class Timeouts:
+    """Per-phase timeouts, and an optional deadline for a whole batch (one
+    library call). The batch deadline starts once the meter's lock is held,
+    so time spent queued behind another reader -- a history backfill, say --
+    never counts against it. Raises :class:`MeterTimeout`."""
+
     connect: float = 10.0
     handshake: float = 20.0  # full handshakes have taken 11 s on a busy meter
     response: float = 20.0
+    batch: float | None = None
 
 
 @dataclass(slots=True)
@@ -643,6 +684,14 @@ class MeterTransport:
         self.stats.connections += 1
         if conn.session_reused:
             self.stats.resumed_connections += 1
+        _LOGGER.debug(
+            "%s:%d: connected in %d ms (%s), meter LFDI %s",
+            self.host,
+            self.port,
+            self.stats.last_handshake_ms,
+            "resumed" if conn.session_reused else "full handshake",
+            self.peer.lfdi if self.peer else "unknown",
+        )
         self._session = conn.session
         return conn
 
@@ -702,8 +751,17 @@ class MeterTransport:
         async with shared.lock:
             shared.owner = task
             b = Batch(self, verify_identity)
+            deadline = asyncio.timeout(self.timeouts.batch)
             try:
-                yield b
+                try:
+                    async with deadline:
+                        yield b
+                except TimeoutError as err:
+                    if deadline.expired():
+                        raise MeterTimeout(
+                            f"{self.host}:{self.port}: call exceeded its {self.timeouts.batch:.0f} s deadline"
+                        ) from err
+                    raise
             except Exception:
                 self.stats.failures += 1
                 raise
@@ -727,6 +785,7 @@ class Batch:
         self._t = transport
         self._verify = verify_identity
         self._conn: _TlsConnection | None = None
+        self._peer: PeerCertificate | None = None
         self._last_request = -1e9
         self._busy = False
         self._closed = False
@@ -758,9 +817,15 @@ class Batch:
             self._busy = True
             try:
                 self._conn = await self._t._connect(verify=self._verify)
+                self._peer = self._t.peer
             finally:
                 self._busy = False
-        return self._t.peer
+        return self._peer
+
+    @property
+    def peer(self) -> PeerCertificate | None:
+        """The meter's certificate on this batch's connection (None until it connects)."""
+        return self._peer
 
     async def request(self, path: str) -> Response:
         # A Batch owns one connection and must stay on one task: two requests
@@ -811,11 +876,13 @@ class Batch:
                 # the lock, beside whatever holds it.
                 raise RuntimeError("Batch used after its batch() block exited")
             self._conn = await t._connect(verify=self._verify)
+            self._peer = t.peer
         conn = self._conn
         host = _host_header(t.host, t.port)
         request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: {CONTENT_TYPE}\r\n\r\n".encode("ascii")
         t.stats.requests += 1
         conn.requests += 1
+        t0 = time.monotonic()
         try:
             async with asyncio.timeout(t.timeouts.response):
                 try:
@@ -833,6 +900,9 @@ class Batch:
             if isinstance(err, TimeoutError):
                 raise MeterTimeout(f"GET {path} timed out after {t.timeouts.response:.0f} s") from err
             raise
+        _LOGGER.debug(
+            "GET %s -> %d, %d bytes in %d ms", path, resp.status, len(resp.body), (time.monotonic() - t0) * 1000
+        )
         if not resp.keep_alive:
             await self.close()
         return resp

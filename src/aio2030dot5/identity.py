@@ -7,7 +7,9 @@ known to accept: P-256 / ECDSA-SHA256, CN=MeterReaderHanClient, critical
 basicConstraints CA:TRUE, critical keyUsage digitalSignature, and the
 critical IEEE 2030.5 self-signed-client policy OID.
 
-Requires the ``cryptography`` package (an optional dependency of this library).
+Identities are plain PEM text, so they can live in a config entry:
+``Identity.to_dict()`` / ``Identity.from_dict()``. The private key never
+appears in a repr or a log message.
 """
 
 from __future__ import annotations
@@ -15,8 +17,9 @@ from __future__ import annotations
 import hashlib
 import re
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from .exceptions import InvalidIdentity
 
@@ -47,11 +50,40 @@ def sfdi_from_lfdi(lfdi: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Identity:
-    cert_pem: bytes
-    key_pem: bytes
+    """A client certificate and its private key, as PEM text.
+
+    Build one with :func:`generate_identity` or :func:`load_identity`. Only
+    ``cert_pem`` and ``key_pem`` are stored by :meth:`to_dict`; the rest is
+    derived from the certificate.
+    """
+
+    cert_pem: str
+    key_pem: str = field(repr=False)
     lfdi: str
     sfdi: str
     not_after: datetime
+    problems: tuple[str, ...] = ()  # what check_identity() found when loaded
+
+    def days_remaining(self, now: datetime | None = None) -> int:
+        return (self.not_after - (now or datetime.now(UTC))).days
+
+    def expired(self, now: datetime | None = None) -> bool:
+        return self.not_after <= (now or datetime.now(UTC))
+
+    def to_dict(self) -> dict[str, str]:
+        """Secret: holds the private key. Redact with ``REDACT_KEYS``."""
+        return {"cert_pem": self.cert_pem, "key_pem": self.key_pem}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Identity:
+        """Reload a stored identity. Tolerates expiry and profile problems
+        (they are in ``problems``); raises :class:`InvalidIdentity` only if it
+        cannot be used at all."""
+        try:
+            cert, key = data["cert_pem"], data["key_pem"]
+        except (KeyError, TypeError) as err:
+            raise InvalidIdentity("not a stored identity", ("missing cert_pem or key_pem",)) from err
+        return load_identity(cert, key, strict=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,17 +146,55 @@ def generate_identity(*, common_name: str = DEFAULT_COMMON_NAME, valid_days: int
     der = cert.public_bytes(serialization.Encoding.DER)
     lfdi = lfdi_from_der(der)
     return Identity(
-        cert_pem=cert.public_bytes(serialization.Encoding.PEM),
+        cert_pem=cert.public_bytes(serialization.Encoding.PEM).decode("ascii"),
         key_pem=key.private_bytes(
             serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-        ),
+        ).decode("ascii"),
         lfdi=lfdi,
         sfdi=sfdi_from_lfdi(lfdi),
         not_after=cert.not_valid_after_utc,
     )
 
 
-def check_identity(cert_pem: bytes, key_pem: bytes | None = None, *, now: datetime | None = None) -> IdentityCheck:
+# Problems that make an identity unusable, as opposed to one a meter may
+# refuse (wrong profile) or that has merely expired.
+_FATAL = ("private key does not match the certificate",)
+
+
+def load_identity(
+    cert_pem: str | bytes, key_pem: str | bytes, *, strict: bool = True, now: datetime | None = None
+) -> Identity:
+    """An :class:`Identity` from PEM text, e.g. pasted into a setup form.
+
+    ``strict`` (for importing): any problem :func:`check_identity` finds --
+    expired, wrong key type, missing 2030.5 policy -- raises
+    :class:`InvalidIdentity` listing them all. ``strict=False`` (for
+    reloading one already in use): only an unusable pair raises, and the
+    rest are kept in ``Identity.problems``.
+    """
+    cert_b = cert_pem.encode("ascii", "replace") if isinstance(cert_pem, str) else cert_pem
+    key_b = key_pem.encode("ascii", "replace") if isinstance(key_pem, str) else key_pem
+    check = check_identity(cert_b, key_b, now=now)
+    fatal = [p for p in check.problems if p in _FATAL]
+    if fatal or (strict and check.problems):
+        raise InvalidIdentity("identity cannot be used: " + "; ".join(check.problems), check.problems)
+    try:
+        cert_text, key_text = cert_b.decode("ascii").strip() + "\n", key_b.decode("ascii").strip() + "\n"
+    except UnicodeDecodeError as err:
+        raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",)) from err
+    return Identity(
+        cert_pem=cert_text,
+        key_pem=key_text,
+        lfdi=check.lfdi,
+        sfdi=check.sfdi,
+        not_after=check.not_after,
+        problems=check.problems,
+    )
+
+
+def check_identity(
+    cert_pem: str | bytes, key_pem: str | bytes | None = None, *, now: datetime | None = None
+) -> IdentityCheck:
     """Validate a certificate (and optionally its key) against what a meter
     requires. Returns every problem found instead of raising on the first;
     raises :class:`InvalidIdentity` only when the input cannot be parsed."""
@@ -133,6 +203,10 @@ def check_identity(cert_pem: bytes, key_pem: bytes | None = None, *, now: dateti
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
+    if isinstance(cert_pem, str):
+        cert_pem = cert_pem.encode("ascii", "replace")
+    if isinstance(key_pem, str):
+        key_pem = key_pem.encode("ascii", "replace")
     try:
         cert = x509.load_pem_x509_certificate(cert_pem)
     except ValueError as err:
