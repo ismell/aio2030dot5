@@ -158,12 +158,13 @@ if peer.client_accepted:
   `MeterNotFound` there means the profile is stale.
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
-  faster than the service allows since the register last changed (so a ToU tier the meter refreshes hourly may step
-  by an hour's worth). A net register may move either way at that rate. It adopts a new series only once it has
-  lasted: an hour and 3 reads upward, a day and 12 reads downward (a net register always uses the upward rule), with
-  no gap over 30 minutes in the reads. All times are your clock, never the meter's. `.rebases` holds the time of each
-  register's latest adoption and `.resets` that of its latest downward one, so a consumer can start a new
-  accumulation cycle instead of booking the step.
+  faster than the service allows: since the value was first seen, but for no more than 2 h past its last read, so a
+  ToU tier the meter refreshes hourly may step by an hour's worth while a spike after a quiet weekend is still a
+  spike. A net register may move either way at that rate. It adopts a new series only once it has been observed long
+  enough: an hour and 3 reads upward, a day and 12 reads downward (a net register always uses the upward rule), with
+  each gap between reads counting for at most 2 h. All times are your clock, never the meter's. `.rebases` holds the
+  time of each register's latest adoption and `.resets` that of its latest downward one, so a consumer can start a new
+  accumulation cycle instead of booking the step. The module docstring has the full rules.
   `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with the meter's own "questionable"
   flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.to_dict()` and restore it with
   `ReadingGuard.from_dict(data)`.
@@ -172,8 +173,8 @@ if peer.client_accepted:
   meter leaves them empty, as Itron does.
 - **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, profiles, `MeterInfo`, `Identity` and
   `ReadingGuard`, for caches, test fixtures and diagnostics. `from_dict()` accepts any mapping and raises
-  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`); `ReadingGuard.from_dict()` ignores what it
-  cannot use and starts fresh.
+  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`); `ReadingGuard.from_dict()` skips malformed
+  entries one by one and keeps the rest.
 
 ## Client identity
 

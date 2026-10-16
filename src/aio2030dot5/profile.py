@@ -347,7 +347,7 @@ class MeterProfile:
             raise ProfileError(f"unsupported profile (version, key scheme) {got!r}")
         pin = d.get("certificate_lfdi")
         if pin is not None and (not isinstance(pin, str) or not re.fullmatch(r"[0-9A-F]{40}", pin)):
-            raise ProfileError(f"malformed certificate_lfdi {pin!r}")
+            raise ProfileError("malformed certificate_lfdi in a cached profile")
         try:
             return cls(
                 host=d["host"],
@@ -358,7 +358,7 @@ class MeterProfile:
                 software_version=_optional_str(d.get("software_version")),
                 time_href=_optional_str(d.get("time_href")),
                 usage_point_href=d["usage_point_href"],
-                poll_rate=int(d.get("poll_rate") or DEFAULT_POLL_RATE),
+                poll_rate=_cached_poll_rate(d.get("poll_rate")),
                 channels=tuple(Channel.from_dict(c) for c in d["channels"]),
                 device_information_href=_optional_str(d.get("device_information_href")),
                 certificate_lfdi=d.get("certificate_lfdi"),
@@ -465,6 +465,15 @@ def _identity(elem: ET.Element) -> str | bytes:
     bare = copy.copy(elem)
     bare.tail = None  # the whitespace after an item differs between pages
     return hashlib.sha256(ET.tostring(bare)).digest()
+
+
+def _cached_poll_rate(value: Any) -> int:
+    """A cached profile's pollRate, bounded like a discovered one (UInt32 seconds)."""
+    if value is None:
+        return DEFAULT_POLL_RATE
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**32:
+        raise ProfileError("malformed poll_rate in a cached profile")
+    return value or DEFAULT_POLL_RATE
 
 
 # -- keys -----------------------------------------------------------------------

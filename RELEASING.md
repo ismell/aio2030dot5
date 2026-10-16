@@ -5,9 +5,10 @@ trusted publishing: no API token exists anywhere.
 
 ## One-time setup
 
-- **PyPI and TestPyPI**: a trusted publisher for project `aio2030dot5`, owner
-  `ismell`, repository `aio2030dot5`, workflow `release.yml`, environments `pypi`
-  and `testpypi` respectively.
+- **PyPI and TestPyPI**: a *pending* trusted publisher (Account → Publishing; the
+  project does not exist there until its first upload) for project `aio2030dot5`,
+  owner `ismell`, repository `aio2030dot5`, workflow `release.yml`, environments
+  `pypi` and `testpypi` respectively.
 - **GitHub environments** (Settings → Environments):
   - `pypi`: deployment branches and tags limited to tags matching `v*`, and a
     required reviewer.
@@ -27,3 +28,8 @@ trusted publishing: no API token exists anywhere.
    The workflow runs the full CI, checks that the tag matches `__version__`,
    builds, and waits for the `pypi` environment's approval before publishing.
 4. Create the GitHub release from the tag, with the CHANGELOG entry as notes.
+
+If the PyPI upload fails halfway (one file uploaded), do not re-run the job: PyPI
+refuses a file that already exists. Download the `dist` artifact from the run and
+upload the missing file with `twine upload` and a short-lived API token, or
+release the next patch version.

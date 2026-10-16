@@ -45,7 +45,7 @@ from .exceptions import (
     MeterProtocolError,
     MeterTimeout,
 )
-from .identity import Identity, lfdi_from_der, sfdi_from_lfdi
+from .identity import Identity, lfdi_from_der, sfdi_from_lfdi, short_lfdi
 from .models import short
 
 _LOGGER = logging.getLogger(__name__)
@@ -444,6 +444,11 @@ class _TlsConnection:
                 # send their auth alert later, so it can arrive here.
                 raise _classify_ssl_error(err, handshake=False) from err
 
+    @property
+    def leftover(self) -> int:
+        """Bytes received after the last complete response (none expected)."""
+        return len(self._buffer)
+
     async def read_response(self) -> Response:
         """Read exactly one HTTP/1.1 response, framed by its own headers."""
         buf = self._buffer
@@ -831,7 +836,7 @@ class MeterTransport:
             self.port,
             self.stats.last_handshake_ms,
             "resumed" if conn.session_reused else "full handshake",
-            self.peer.lfdi if self.peer else "unknown",
+            short_lfdi(self.peer.lfdi) if self.peer else "unknown",
         )
         self._session = conn.session
         return conn
@@ -1057,7 +1062,12 @@ class Batch:
         _LOGGER.debug(
             "GET %s -> %d, %d bytes in %d ms", path, resp.status, len(resp.body), (time.monotonic() - t0) * 1000
         )
-        if not resp.keep_alive:
+        if conn.leftover:
+            # We never pipeline, so bytes after a complete response mean the
+            # stream is out of step: never serve them as the next response.
+            _LOGGER.debug("GET %s: %d unexpected bytes after the response; reconnecting", path, conn.leftover)
+            self._kill()
+        elif not resp.keep_alive:
             await self.close()
         return resp
 

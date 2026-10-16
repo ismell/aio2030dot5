@@ -3,36 +3,45 @@
 Brief absurd spikes have been seen from HAN agents (and are cheap to guard
 against), and one bad sample of a lifetime register corrupts a consumer's
 long-term statistics for good. :class:`ReadingGuard` is an optional filter for
-consumers:
+consumers. :meth:`ReadingGuard.accept` applies it to a whole
+:class:`MeterSnapshot`, together with the meter's own verdict (readings it flags
+questionable).
 
-* power must be within +/- ``max_power`` W (a residential 240 V service tops
-  out near 48 kW);
-* a register (energy, VAh, varh totals and ToU tiers) must not decrease, and
-  may grow no faster than ``max_power`` allows since the last accepted value
-  (plus 1 kWh of slack). A *net* register (delivered minus received) may move
-  either way, at that same rate.
+**Time.** All times are the consumer's clock, never the meter's. For each
+register the guard keeps its value, when that value was *first seen*, and when
+it was *last seen* (the latest read that repeated it).
 
-:meth:`ReadingGuard.accept` applies all of that to a whole :class:`MeterSnapshot`,
-together with the meter's own verdict (readings it flags questionable).
+**Power** must be within +/- ``max_power`` W (a residential 240 V service tops
+out near 48 kW).
 
-A real change of baseline -- a replaced or reset meter -- shows up as rejected
-reads that are consistent *with each other*. The guard adopts such a series
-only once it has lasted: ``confirm`` reads over at least ``confirm_seconds``
-(default 1 h), or, when the new series is *below* the old one,
-``confirm_decrease`` reads over at least ``confirm_decrease_seconds`` (default
-24 h). The time spans matter more than the counts: they keep a meter that
-answers 0 for a while (an agent restarting before its metrology is up) from
-being taken for a reset however often it is polled.
+**A register** (energy, VAh, varh totals and ToU tiers) must not decrease, and
+may grow by at most ``max_power`` times its *allowance* plus 1 kWh of slack.
+The allowance is the time since the value was first seen, but no more than the
+time since it was last seen plus ``max_refresh`` (default 2 h)::
 
-A run survives a short restart (it is part of :meth:`ReadingGuard.to_dict`) and
-the odd stray reading (at most one per five reads), but reads alternating
-between two series never form one, and a gap of more than 30 minutes without
-reads starts it over: confirmation counts only time actually observed.
+    allowance = min(now - first_seen, now - last_seen + max_refresh)
 
-All times are the consumer's clock. A register's time is when its current
-value was first seen, so a register the meter refreshes only now and then
-(ToU tiers, about hourly on an Itron) is allowed what the time since its last
-change allows.
+A register the meter refreshes only now and then (ToU tiers, about hourly on an
+Itron) may so step by what the hour since its last change allows, while one that
+merely sat still for days (an off-peak tier over a weekend, the export register
+at night) earns no more than ``max_refresh``: a spike after a quiet spell is
+still a spike. Time the consumer could not read the meter (a restart, an outage)
+counts in full. A *net* register (delivered minus received) may move either way,
+by the same allowance.
+
+**A new baseline** -- a replaced or reset meter -- shows up as rejected reads
+that are consistent with each other (a *run*). The guard adopts a run only once
+it has been observed long enough: ``confirm`` reads over ``confirm_seconds``
+(3 reads, 1 h) when the new series is above the old one, ``confirm_decrease``
+reads over ``confirm_decrease_seconds`` (12 reads, 24 h) when it is below. Only
+observed time counts: each gap between reads adds at most ``max_gap`` (default
+2 h), so a restart or an outage does not confirm anything, while polling every
+15 or 30 minutes, with the odd missed poll, still adds up. The time spans keep a
+meter that answers 0 for a while (an agent restarting before its metrology is
+up) from being taken for a reset, however often it is polled. A run tolerates
+one stray read per four consistent ones (a lone spike does not cost a day's
+confirmation), so reads alternating between two series never form one. Runs are
+part of :meth:`ReadingGuard.to_dict`.
 
 Every adoption is recorded in :attr:`ReadingGuard.rebases`, and a downward one
 also in :attr:`ReadingGuard.resets`: a consumer keeping a running total should
@@ -59,21 +68,23 @@ __all__ = ["AcceptedReadings", "ReadingGuard", "questionable"]
 
 _LOGGER = logging.getLogger(__name__)
 _SLACK_WH = 1000.0
-_RUN_GAP = 1800.0  # seconds without reads that break a run being confirmed
 
 
 @dataclass(slots=True)
 class _Run:
-    """Consistent rejected reads that may be a new baseline."""
+    """Consistent rejected reads that may become the new baseline."""
 
-    first_time: float
-    last: tuple[float, float]  # (value, epoch seconds) of the latest read
-    count: int = 1
+    value: float  # its latest value
+    first_seen: float  # when that value was first seen
+    last_read: float  # the latest read of any kind (consistent or stray)
+    count: int = 1  # consistent reads
     strays: int = 0  # inconsistent reads tolerated inside the run
+    observed: float = 0.0  # seconds of observation, each gap counted up to max_gap
 
-    def extend(self, cur: tuple[float, float]) -> None:
-        self.last = cur
-        self.count += 1
+
+def _strays_allowed(strays: int, count: int) -> bool:
+    """The run invariant: at most one stray per four consistent reads."""
+    return 0 <= strays and strays * 4 <= count
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +109,8 @@ def questionable(measurement: Measurement) -> bool:
 
 
 class ReadingGuard:
-    """Plausibility checks for one meter's readings. Persist with
-    :meth:`to_dict` / :meth:`from_dict` so a spike right after a restart is caught."""
+    """Plausibility checks for one meter's readings (see the module docs). Persist
+    with :meth:`to_dict` / :meth:`from_dict` so a spike right after a restart is caught."""
 
     def __init__(
         self,
@@ -108,21 +119,26 @@ class ReadingGuard:
         confirm_decrease: int = 12,
         confirm_seconds: float = 3600.0,
         confirm_decrease_seconds: float = 86400.0,
+        max_refresh: float = 7200.0,
+        max_gap: float = 7200.0,
     ) -> None:
         self.max_power = max_power
         self.confirm = confirm
         self.confirm_decrease = confirm_decrease
         self.confirm_seconds = confirm_seconds
         self.confirm_decrease_seconds = confirm_decrease_seconds
-        # key -> (value, epoch seconds) of the last accepted reading
+        self.max_refresh = max_refresh
+        self.max_gap = max_gap
+        # key -> (value, epoch seconds the value was first seen)
         self.registers: dict[str, tuple[float, float]] = {}
+        # key -> epoch seconds of the latest read that repeated the register's value
+        self.last_seen: dict[str, float] = {}
         # key -> epoch seconds of the last rebase of any kind / of a downward one
         self.rebases: dict[str, float] = {}
         self.resets: dict[str, float] = {}
-        # key -> (value, epoch seconds) of the baseline the last rebase replaced;
+        # key -> (value, first seen) of the baseline the last rebase replaced;
         # kept for confirm_decrease_seconds after that rebase
         self.displaced: dict[str, tuple[float, float]] = {}
-        # key -> the run of consistent rejected reads that may become the baseline
         self._pending: dict[str, _Run] = {}
         self.rejected = 0
         self._rejecting: set[str] = set()  # keys in a run of rejections (logged once)
@@ -140,11 +156,6 @@ class ReadingGuard:
         channels through :meth:`power`; other channels pass as read. A reading
         the meter flags questionable is None and never reaches the guard.
         Channels not in ``profile`` are skipped.
-
-        Time is the consumer's (``now``), never the meter's. A register's time
-        is when its current value was first seen, so one the meter refreshes
-        only now and then (ToU tiers, about hourly on an Itron) may grow by what
-        the hour since its last change allows, however often it is polled.
         """
         now = time.time() if now is None else now
         values: dict[str, float | None] = {}
@@ -195,85 +206,98 @@ class ReadingGuard:
     def register(self, key: str, value: float | None, now: float, *, monotonic: bool = True) -> float | None:
         """The register reading (``now``: epoch seconds, the consumer's clock), or
         None if it is implausible. ``monotonic=False`` for a net register, which
-        may decrease. A repeated value keeps the time it was first seen."""
+        may decrease."""
         if value is None:
             return None
-        cur = (value, now)
         displaced = self.displaced.get(key)
         if displaced is not None and now - self.rebases.get(key, displaced[1]) > self.confirm_decrease_seconds:
             del self.displaced[key]  # expired: the new series stands
             displaced = None
         last = self.registers.get(key)
-        if last is not None and value == last[0]:
-            self._adopt(key, last)  # unchanged: the growth bound keeps counting from its change
+        if last is None:
+            self._adopt(key, value, now)
             return value
-        if last is None or self._plausible(last, cur, monotonic):
-            self._adopt(key, cur)
+        last_value, first_seen = last
+        if value == last_value:
+            self.last_seen[key] = now
+            self._pending.pop(key, None)
+            self._recovered(key)
+            return value
+        if self._plausible(last_value, first_seen, self.last_seen.get(key, first_seen), value, now, monotonic):
+            self._adopt(key, value, now)
             return value
         if displaced is not None:
-            if self._plausible(displaced, cur, monotonic):
-                _LOGGER.warning("%s: back to the earlier series at %s (was %s)", key, value, last[0])
+            rebased = self.rebases.get(key, displaced[1])
+            if self._plausible(displaced[0], displaced[1], rebased, value, now, monotonic):
+                _LOGGER.warning("%s: back to the earlier series at %s (was %s)", key, value, last_value)
                 del self.displaced[key]
                 self.rebases[key] = now
-                self._adopt(key, cur)
+                self._adopt(key, value, now)
                 return value
-        run = self._track(key, cur, monotonic)
-        if run is None:  # a stray inside an established run: rejected, the run kept
-            self._reject(key, value, f"after {last[0]:.0f}")
+        run = self._track(key, value, now, monotonic)
+        if run is None:  # a stray inside a run: rejected, the run kept
+            self._reject(key, value, f"after {last_value:.0f}")
             return None
-        down = monotonic and value < last[0]
+        down = monotonic and value < last_value
         needed, span = (
             (self.confirm_decrease, self.confirm_decrease_seconds) if down else (self.confirm, self.confirm_seconds)
         )
-        if run.count >= needed and now - run.first_time >= span:
+        if run.count >= needed and run.observed >= span:
             _LOGGER.warning(
                 "%s: rebasing from %s to %s after %d consistent reads over %.0f s (meter replaced or reset?)",
                 key,
-                last[0],
+                last_value,
                 value,
                 run.count,
-                now - run.first_time,
+                run.observed,
             )
             self.rebases[key] = now
             if down:
                 self.resets[key] = now
             self.displaced[key] = last
-            self._adopt(key, cur)
+            self._adopt(key, value, now)
             return value
-        self._reject(key, value, f"after {last[0]:.0f}")
+        self._reject(key, value, f"after {last_value:.0f}")
         return None
 
-    def _track(self, key: str, cur: tuple[float, float], monotonic: bool) -> _Run | None:
-        """Add a rejected read to the run it is consistent with. A read that is
-        not is a stray: a run tolerates at most one stray per five reads (a lone
-        spike does not cost a day's confirmation), but no more -- reads
-        alternating between two series never form a run. A gap of more than
-        ``_RUN_GAP`` seconds without reads (a restart, an outage) starts over:
-        confirmation counts only time the series was actually observed.
-        The run ``cur`` belongs to, or None if ``cur`` is a tolerated stray."""
+    def _track(self, key: str, value: float, now: float, monotonic: bool) -> _Run | None:
+        """Add a rejected read to its run (see the module docs). The run ``value``
+        belongs to, or None if it is a stray the run tolerates."""
         run = self._pending.get(key)
-        if run is not None and cur[1] - run.last[1] > _RUN_GAP:
-            run = None
-        if run is not None and self._plausible(run.last, cur, monotonic):
-            run.extend(cur)
-            return run
-        if run is not None and (run.strays + 1) * 4 <= run.count:
-            run.strays += 1
-            return None
-        run = self._pending[key] = _Run(cur[1], cur)
+        if run is not None:
+            credit = min(max(now - run.last_read, 0.0), self.max_gap)
+            if self._plausible(run.value, run.first_seen, run.last_read, value, now, monotonic):
+                if value != run.value:
+                    run.value, run.first_seen = value, now
+                run.last_read = now
+                run.count += 1
+                run.observed += credit
+                return run
+            if _strays_allowed(run.strays + 1, run.count):
+                run.strays += 1
+                run.last_read = now
+                run.observed += credit
+                return None
+        run = self._pending[key] = _Run(value, now, now)
         return run
 
-    def _adopt(self, key: str, cur: tuple[float, float]) -> None:
+    def _adopt(self, key: str, value: float, now: float) -> None:
         self._pending.pop(key, None)
-        self.registers[key] = cur
+        self.registers[key] = (value, now)
+        self.last_seen[key] = now
         self._recovered(key)
 
-    def _plausible(self, prev: tuple[float, float], cur: tuple[float, float], monotonic: bool = True) -> bool:
-        (prev_value, prev_time), (value, now) = prev, cur
-        bound = self.max_power * max(now - prev_time, 1.0) / 3600 + _SLACK_WH
+    def _allowance(self, first_seen: float, last_seen: float, now: float) -> float:
+        """Seconds of growth a register earned since its value was first seen."""
+        return max(min(now - first_seen, now - last_seen + self.max_refresh), 1.0)
+
+    def _plausible(
+        self, prev: float, first_seen: float, last_seen: float, value: float, now: float, monotonic: bool
+    ) -> bool:
+        bound = self.max_power * self._allowance(first_seen, last_seen, now) / 3600 + _SLACK_WH
         if monotonic:
-            return prev_value <= value <= prev_value + bound
-        return abs(value - prev_value) <= bound
+            return prev <= value <= prev + bound
+        return abs(value - prev) <= bound
 
     def _reject(self, key: str, value: float, why: str) -> None:
         self.rejected += 1
@@ -292,10 +316,14 @@ class ReadingGuard:
         """The state to persist (JSON-safe), including runs still being confirmed."""
         return {
             "registers": {key: list(reading) for key, reading in self.registers.items()},
+            "last_seen": dict(self.last_seen),
             "rebases": dict(self.rebases),
             "resets": dict(self.resets),
             "displaced": {key: list(reading) for key, reading in self.displaced.items()},
-            "pending": {key: [r.first_time, *r.last, r.count, r.strays] for key, r in self._pending.items()},
+            "pending": {
+                key: [r.value, r.first_seen, r.last_read, r.count, r.strays, r.observed]
+                for key, r in self._pending.items()
+            },
         }
 
     @classmethod
@@ -306,45 +334,62 @@ class ReadingGuard:
         return guard
 
     def restore(self, data: Any) -> None:
-        """Load :meth:`to_dict` output into this guard (e.g. one built with other
-        limits). Malformed or missing state is ignored, entry by entry."""
+        """Load :meth:`to_dict` output (also 0.3.x state) into this guard, e.g. one
+        built with other limits. Malformed entries are ignored one by one; the
+        rest is kept."""
         if not isinstance(data, Mapping):
             return
         for name in ("registers", "displaced"):
-            readings = data.get(name)
             target = getattr(self, name)
-            for key, reading in readings.items() if isinstance(readings, Mapping) else ():
-                if not isinstance(reading, list | tuple) or len(reading) != 2:
-                    continue
-                try:
-                    target[str(key)] = (_finite(reading[0]), _finite(reading[1]))
-                except ValueError:
-                    continue
-        runs = data.get("pending")
-        for key, run in runs.items() if isinstance(runs, Mapping) else ():
-            if not isinstance(run, list | tuple) or len(run) != 5:
-                continue
-            try:
-                first, value, when, count, strays = (_finite(x) for x in run)
-            except ValueError:
-                continue
-            if count >= 1 and 0 <= strays and (strays + 1) * 5 <= count + 5 and count < 2**31:
-                self._pending[str(key)] = _Run(first, (value, when), int(count), int(strays))
-        for name in ("rebases", "resets"):
-            times = data.get(name)
+            for key, reading in _items(data.get(name)):
+                numbers = _numbers(reading, 2)
+                if numbers is not None:
+                    target[str(key)] = (numbers[0], numbers[1])
+        for name in ("last_seen", "rebases", "resets"):
             target = getattr(self, name)
-            for key, when in times.items() if isinstance(times, Mapping) else ():
-                try:
-                    target[str(key)] = _finite(when)
-                except ValueError:
-                    continue
+            for key, when in _items(data.get(name)):
+                numbers = _numbers([when], 1)
+                if numbers is not None:
+                    target[str(key)] = numbers[0]
+        for key, run in _items(data.get("pending")):
+            numbers = _numbers(run, 6)
+            if numbers is None:
+                continue
+            value, first_seen, last_read, count, strays, observed = numbers
+            if (
+                count.is_integer()
+                and strays.is_integer()
+                and count >= 1
+                and _strays_allowed(int(strays), int(count))
+                and observed >= 0
+                and first_seen <= last_read
+            ):
+                self._pending[str(key)] = _Run(value, first_seen, last_read, int(count), int(strays), observed)
+
+
+def _items(section: Any) -> list[tuple[Any, Any]]:
+    """The entries of a stored section, or none if it is not a mapping."""
+    return list(section.items()) if isinstance(section, Mapping) else []
+
+
+def _numbers(entry: Any, length: int) -> list[float] | None:
+    """A stored list of ``length`` finite numbers, or None if it is anything else."""
+    if not isinstance(entry, list | tuple) or len(entry) != length:
+        return None
+    try:
+        return [_finite(x) for x in entry]
+    except ValueError:
+        return None
 
 
 def _finite(value: Any) -> float:
-    """A stored number; ValueError for anything else, incl. bools, NaN and infinities."""
-    if isinstance(value, bool) or not isinstance(value, int | float | str):
+    """A stored number; ValueError for anything else: bools, strings, NaN, infinities."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"not a number: {value!r}")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError("too large") from None
     if not math.isfinite(number):
         raise ValueError(f"not finite: {value!r}")
     return number

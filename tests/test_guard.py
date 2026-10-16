@@ -144,14 +144,39 @@ def test_a_confirmation_survives_restarts() -> None:
     assert "r" in guard.resets
 
 
-def test_a_gap_in_the_reads_starts_a_confirmation_over() -> None:
-    """Downtime is not observation: an hour without reads breaks the run."""
+def test_downtime_counts_only_up_to_max_gap_toward_a_confirmation() -> None:
+    """An outage is not observation: 10 h without reads adds only 2 h (max_gap)."""
     guard = ReadingGuard()
     guard.register("r", LIFETIME, NOW)
-    before = _series(guard, [float(i) for i in range(48)], NOW, QUARTER)  # 12 h of reads
-    after = _series(guard, [float(i) for i in range(60, 120)], NOW + 49 * QUARTER + HOUR, QUARTER)
-    assert before == [None] * 48 and after == [None] * 60  # 12 h + 15 h, but never 24 h in one run
-    assert guard.resets == {}
+    before = _series(guard, [float(i) for i in range(48)], NOW, QUARTER)  # 11.75 h observed
+    resume = NOW + 48 * QUARTER + 10 * HOUR  # 10 h with no reads at all
+    after = _series(guard, [float(i) for i in range(100, 160)], resume, QUARTER)
+    assert before == [None] * 48
+    adopted = next(i for i, v in enumerate(after) if v is not None)
+    # 11.75 h + 2 h (the outage, capped) + 15 min (resume) + the rest at 15 min a read: 24 h after ~40 more reads.
+    assert 38 <= adopted <= 42
+    assert "r" in guard.resets
+
+
+def test_a_slow_poller_still_confirms_a_reset() -> None:
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    results = _series(guard, [float(i) for i in range(60)], NOW, 1800.0)  # every 30 minutes
+    assert results[47] is None and results[48] == 48.0  # 24 h observed after the first read
+
+
+def test_jittered_polls_with_a_missed_poll_and_a_stray_still_confirm() -> None:
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    t, adopted = NOW, None
+    for i in range(140):
+        t += QUARTER + (37 if i % 3 else -23)  # not exactly 900 s apart
+        if i == 50:
+            t += QUARTER  # a missed poll
+        value = 9e12 if i == 70 else float(i)  # one absurd read
+        if guard.register("r", value, t) is not None and adopted is None:
+            adopted = t
+    assert adopted is not None and DAY <= adopted - NOW <= DAY + 2 * HOUR
 
 
 def test_a_lone_spike_does_not_restart_a_long_confirmation() -> None:
@@ -360,11 +385,47 @@ def test_a_register_refreshed_hourly_is_not_a_spike() -> None:
 
 def test_malformed_saved_state_is_ignored_entry_by_entry() -> None:
     state = {
-        "registers": {"ok": [1.0, 2.0], "dict": {"x": 1}, "short": "ab", "inf": [1, "inf"], "long": [1, 2, 3]},
-        "pending": {"ok": [1, 2, 3, 4, 0], "huge": [1, 2, 3, 1e400, 0], "strays": [1, 2, 3, 2, 9], "dict": {"a": 1}},
-        "rebases": {"ok": 5, "bool": True, "nan": "nan"},
+        "registers": {"ok": [1.0, 2.0], "dict": {"x": 1}, "short": "ab", "inf": [1, float("inf")], "long": [1, 2, 3]},
+        "pending": {
+            "ok": [1, 2, 3, 4, 1, 0],  # a run that tolerated one stray: kept
+            "huge": [1, 2, 3, 10**400, 0, 0],
+            "strays": [1, 2, 3, 2, 9, 0],
+            "fraction": [1, 2, 3, 4.5, 0, 0],
+            "backwards": [1, 5, 3, 4, 0, 0],
+            "text": [1, 2, 3, "4", 0, 0],
+            "dict": {"a": 1},
+        },
+        "rebases": {"ok": 5, "bool": True, "huge": 10**400, "text": "5"},
     }
     guard = ReadingGuard.from_dict(state)
     assert guard.registers == {"ok": (1.0, 2.0)}
     assert guard.pending == ["ok"]
     assert guard.rebases == {"ok": 5.0}
+
+
+def test_a_spike_after_a_quiet_spell_is_still_a_spike() -> None:
+    """A register that sat still (an off-peak tier over a weekend, export at night)
+    earns at most max_refresh of growth, not the whole quiet spell."""
+    guard = ReadingGuard()
+    guard.register("tier", 7_745_743.0, NOW)
+    t = NOW
+    for _ in range(68 * 60):  # 68 h unchanged, read every minute
+        t += 60
+        assert guard.register("tier", 7_745_743.0, t) == 7_745_743.0
+    assert guard.register("tier", 7_745_743.0 + 2e6, t + 60) is None  # +2 MWh
+    assert guard.register("tier", 7_745_743.0 + 50, t + 120) == 7_745_743.0 + 50  # the real register goes on
+
+
+def test_growth_while_the_consumer_was_down_is_allowed() -> None:
+    guard = ReadingGuard()
+    guard.register("r", 1_000_000.0, NOW)
+    assert guard.register("r", 1_030_000.0, NOW + 10 * HOUR) == 1_030_000.0  # 30 kWh in a 10 h outage
+
+
+def test_a_run_saved_right_after_a_stray_survives_a_restart() -> None:
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    _series(guard, [float(i) for i in range(8)], NOW, QUARTER)
+    guard.register("r", 9e12, NOW + 9 * QUARTER)  # a tolerated stray
+    assert guard.pending == ["r"]
+    assert ReadingGuard.from_dict(guard.to_dict()).pending == ["r"]

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .exceptions import InvalidIdentity
+from .exceptions import InvalidIdentity, short_lfdi
 
 IEEE_2030_5_SELF_SIGNED_POLICY = "1.3.6.1.4.1.40732.2.2"
 DEFAULT_COMMON_NAME = "MeterReaderHanClient"
@@ -60,13 +60,6 @@ def format_lfdi(lfdi: str) -> str:
     if not re.fullmatch(r"[0-9A-F]{40}", digits):
         raise ValueError(f"an LFDI is 40 hex digits, got {lfdi!r}")
     return "-".join(digits[i : i + 5] for i in range(0, 40, 5))
-
-
-def short_lfdi(lfdi: str | None) -> str:
-    """An LFDI for logs and messages: its last six hex digits. Users paste logs
-    into public issues; the suffix tells two certificates apart without
-    revealing the device (the SFDI comes from the LFDI's first digits)."""
-    return f"...{lfdi[-6:]}" if lfdi else "none"
 
 
 def canonical_sfdi(sfdi: str | int) -> str:

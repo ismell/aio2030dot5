@@ -195,13 +195,14 @@ def _number_text(elem: ET.Element, name: str) -> str | None:
     """A numeric child's text, unclamped: a number too long for any 2030.5
     type is an error, never silently truncated."""
     c = child(elem, name)
-    t = c.text.strip() if c is not None and c.text is not None else ""
+    t = c.text.strip(_XML_SPACE) if c is not None and c.text is not None else ""
     if len(t) > 40:
         raise MeterProtocolError(f"<{name}> is {len(t)} characters long: {short(t)}")
     return t or None
 
 
 _INTEGER = re.compile(r"[+-]?[0-9]+")
+_XML_SPACE = " \t\r\n"  # the whitespace XML Schema collapses; no other
 
 
 def int_or_none(elem: ET.Element, name: str) -> int | None:
@@ -249,7 +250,7 @@ def int_attr(elem: ET.Element, name: str, default: int = 0) -> int:
     raw = elem.get(name)
     if raw is None:
         return default
-    if len(raw) > 40 or not _INTEGER.fullmatch(raw.strip()):
+    if len(raw) > 40 or not _INTEGER.fullmatch(raw.strip(_XML_SPACE)):
         raise MeterProtocolError(f"attribute {name}={short(raw)} is not an integer")
     return int(raw)
 

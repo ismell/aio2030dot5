@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import suppress
 
 from zeroconf import IPVersion, ServiceStateChange, Zeroconf
@@ -79,18 +80,24 @@ async def _browse(aiozc: AsyncZeroconf, listen: float, want: str | None) -> list
 async def _resolve(aiozc: AsyncZeroconf, name: str) -> Advertisement | None:
     info = AsyncServiceInfo(SERVICE_TYPE, name)
     if not await info.async_request(aiozc.zeroconf, int(_RESOLVE_TIMEOUT * 1000)):
-        _LOGGER.debug("%s did not resolve", name)
+        _LOGGER.debug("%s did not resolve", _masked(name))
         return None
     # Prefer IPv4: the meters seen so far have no routable IPv6 address.
     addresses = info.parsed_scoped_addresses(IPVersion.V4Only) or info.parsed_scoped_addresses()
     if not addresses or info.port is None:
-        _LOGGER.debug("%s has no address or port", name)
+        _LOGGER.debug("%s has no address or port", _masked(name))
         return None
     try:
         return parse_advertisement(name, addresses[0], info.port, info.properties)
     except MeterProtocolError as err:
-        _LOGGER.debug("ignoring %s: %s", name, err)
+        _LOGGER.debug("ignoring %s: %s", _masked(name), err)
         return None
+
+
+def _masked(name: str) -> str:
+    """An instance name for logs: the SFDI in it identifies the meter, so keep
+    only its last three digits."""
+    return re.sub(r"\d{4,}(\d{3})", r"...\1", name)
 
 
 # The public names; everything else here is internal.

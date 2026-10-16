@@ -32,6 +32,14 @@ __all__ = [
     "ProfileError",
 ]
 
+
+def short_lfdi(lfdi: str | None) -> str:
+    """An LFDI for logs and messages: its last six hex digits. Users paste logs
+    into public issues; the suffix tells two certificates apart without
+    revealing the device (the SFDI comes from the LFDI's first digits)."""
+    return f"...{lfdi[-6:]}" if lfdi else "none"
+
+
 # Why the meter refused our certificate: the values of MeterAuthError.reason.
 AuthReason = Literal[
     "certificate_rejected",
@@ -73,8 +81,8 @@ class MeterIdentityMismatch(MeterError):
     def __init__(self, host: str, expected: str, actual: str | None) -> None:
         # The message shortens the LFDIs (logs get pasted into public issues);
         # the attributes keep them whole.
-        who = f"LFDI ...{actual[-6:]}" if actual else "a device that did not prove its identity"
-        super().__init__(f"{host} is not the expected meter: {who}, expected LFDI ...{expected[-6:]}")
+        who = f"LFDI {short_lfdi(actual)}" if actual else "a device that did not prove its identity"
+        super().__init__(f"{host} is not the expected meter: {who}, expected LFDI {short_lfdi(expected)}")
         self.host = host
         self.expected = expected
         self.actual = actual
@@ -130,11 +138,11 @@ class ProfileError(MeterError):
 class MeterHttpError(MeterProtocolError):
     """A non-2xx HTTP status."""
 
-    def __init__(self, path: str, status: int, reason: str = "") -> None:
-        super().__init__(f"GET {path} -> HTTP {status} {reason}".rstrip())
+    def __init__(self, path: str, status: int, reason_phrase: str = "") -> None:
+        super().__init__(f"GET {path} -> HTTP {status} {reason_phrase}".rstrip())
         self.path = path
         self.status = status
-        self.reason_phrase = reason
+        self.reason_phrase = reason_phrase
 
     def __reduce__(self) -> tuple[type, tuple[str, int, str], dict[str, object]]:
         return type(self), (self.path, self.status, self.reason_phrase), self.__dict__
