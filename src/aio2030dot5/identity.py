@@ -2,8 +2,7 @@
 
 A HAN meter admits a client whose self-signed certificate's LFDI has been
 registered with the utility (for Xcel Energy, under Meters and devices in
-My Account). The
-profile generated here mirrors a certificate an Itron Gen5 Riva meter is
+My Account). The profile generated here mirrors a certificate an Itron Gen5 Riva meter is
 known to accept: P-256 / ECDSA-SHA256, CN=MeterReaderHanClient, critical
 basicConstraints CA:TRUE, critical keyUsage digitalSignature, and the
 critical IEEE 2030.5 self-signed-client policy OID.
@@ -35,6 +34,7 @@ def lfdi_from_der(der: bytes) -> str:
 
 
 def lfdi_from_pem(pem: str | bytes) -> str:
+    """The LFDI (40 upper-case hex digits) of a PEM certificate."""
     text = pem.decode("ascii") if isinstance(pem, bytes) else pem
     return lfdi_from_der(ssl.PEM_cert_to_DER_cert(text))
 
@@ -90,9 +90,11 @@ class Identity:
         return f"Identity(lfdi={self.lfdi!r}, not_after={self.not_after.isoformat()!r}, problems={self.problems!r})"
 
     def days_remaining(self, now: datetime | None = None) -> int:
+        """Whole days until the certificate expires (negative once it has)."""
         return (self.not_after - (now or datetime.now(UTC))).days
 
     def expired(self, now: datetime | None = None) -> bool:
+        """True once the certificate's notAfter has passed."""
         return self.not_after <= (now or datetime.now(UTC))
 
     def to_dict(self) -> dict[str, str]:
@@ -123,6 +125,7 @@ class IdentityCheck:
         return not self.problems
 
     def days_remaining(self, now: datetime | None = None) -> int:
+        """Whole days until the certificate expires (negative once it has)."""
         return (self.not_after - (now or datetime.now(UTC))).days
 
 
@@ -304,3 +307,18 @@ def check_identity(
     return IdentityCheck(
         lfdi=lfdi, sfdi=sfdi_from_lfdi(lfdi), not_after=cert.not_valid_after_utc, problems=tuple(problems)
     )
+
+
+# The public names; everything else here is internal.
+__all__ = [
+    "Identity",
+    "IdentityCheck",
+    "canonical_sfdi",
+    "check_identity",
+    "format_lfdi",
+    "generate_identity",
+    "lfdi_from_der",
+    "lfdi_from_pem",
+    "load_identity",
+    "sfdi_from_lfdi",
+]

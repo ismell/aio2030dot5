@@ -12,8 +12,8 @@ Observed on an Itron Gen5 Riva (agent 3.2.50):
 * it answers ``_smartenergy._tcp`` PTR queries but not the ``_upt._sub``
   subtype, sends no unsolicited announcements, and ignores unicast queries
   from off-link sources (so across subnets it needs an mDNS repeater);
-* some firmware answered from a UDP source port other than 5353, which strict
-  resolvers drop (fixed by the utility in 2025; python-zeroconf accepts it).
+* some firmware has been reported to answer from a UDP source port other
+  than 5353, which strict resolvers drop (python-zeroconf accepts it).
 
 The meter's SFDI in the instance name identifies it before any connection --
 and before the client's certificate is registered -- so it suits a config
@@ -118,3 +118,12 @@ def parse_advertisement(
         level=txt.get("level") or None,
         txt=txt,
     )
+
+
+# The public names; everything else here is internal.
+__all__ = [
+    "SERVICE_TYPE",
+    "Advertisement",
+    "is_valid_sfdi",
+    "parse_advertisement",
+]

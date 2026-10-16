@@ -570,6 +570,7 @@ class Measurement:
 
     @classmethod
     def of(cls, reading: Reading, reading_type: ReadingType) -> Measurement:
+        """A Reading, scaled and labelled by its MeterReading's ReadingType."""
         return cls(
             value=reading_type.scale(reading.raw_value),
             unit=reading_type.unit,
@@ -808,3 +809,20 @@ MANUFACTURERS: dict[int, str] = {1233: "Itron"}
 def manufacturer_name(manufacturer_id: int | None) -> str | None:
     """The vendor behind an mfID, when known."""
     return MANUFACTURERS.get(manufacturer_id) if manufacturer_id is not None else None
+
+
+# The public names; everything else here is internal.
+__all__ = [
+    "DeviceInformation",
+    "HourlyEnergy",
+    "IntervalValue",
+    "Measurement",
+    "MeterTime",
+    "QualityFlags",
+    "ReadingSetInfo",
+    "ReadingType",
+    "TouRegister",
+    "Uom",
+    "hourly_energy",
+    "manufacturer_name",
+]

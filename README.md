@@ -11,7 +11,8 @@ These meters are fragile:
 - They serve **one TLS connection at a time**.
 - They close idle connections after **30 s**.
 - They intermittently fail handshakes with **`BAD_SIGNATURE`**.
-- They are reported to stop answering ("clamp down") when polled hard.
+- They can stop answering for hours while staying on the Wi-Fi (seen on the author's meter; a forced Wi-Fi
+  reconnect brings it back).
 
 This library is designed around that:
 
@@ -24,14 +25,25 @@ This library is designed around that:
   - one handshake retry after `BAD_SIGNATURE`;
   - one reconnect when the meter drops a kept-alive connection before answering (GET is idempotent).
 
-  Exceptions say what happened, and the caller decides:
-  - `MeterConnectionError`, `MeterTimeout` or `MeterBusy` → back off;
-  - `MeterAuthError(reason=...)` → the certificate is not registered, or expired;
-  - `MeterNotFound` → rediscover;
-  - `ProfileError` → a cached profile is stale.
+  Exceptions say what happened, and the caller decides. Every one is a `MeterError`:
 
-  One call can take a while on a struggling meter: pacing, connect, a handshake retry and the response add up to
-  about 3 minutes with the default timeouts. Wrap calls in your own deadline if you need one.
+  ```
+  MeterError
+  ├── MeterConnectionError        back off and retry (MeterTimeout, MeterBusy are kinds of it)
+  ├── MeterIdentityMismatch       another device answers at this address: locate the meter again (mDNS)
+  ├── MeterAuthError              our certificate is refused (.reason says why): the user must act
+  ├── MeterProtocolError          the meter answered something unusable
+  │   └── MeterHttpError
+  │       └── MeterNotFound       a cached path is gone: rediscover
+  ├── ProfileError                a cached profile is unusable: rediscover
+  └── InvalidIdentity             a certificate/key that cannot be used
+  ```
+
+  Starting a batch from inside another one for the same meter raises `RuntimeError` (it would deadlock).
+
+  Each request is bounded by `Timeouts` (by default connect 10 s, handshake 20 s, response 20 s, with one
+  handshake retry and one reconnect), but one call makes several requests (`discover()` about 30). For a deadline
+  on the whole call, set `Timeouts(batch=…)`.
 - **One meter, one lock.** Every `Meter` object for the same meter on an event loop shares a lock and connection pacing,
   keyed by resolved address and port. "meter.local" and its IP are one meter. Batches are not re-entrant: starting one from inside
   another raises `RuntimeError` rather than deadlocking.
@@ -58,10 +70,11 @@ This library is designed around that:
 ## Install
 
 ```
-pip install aio2030dot5               # or aio2030dot5[zeroconf] for discovery
+pip install aio2030dot5               # or 'aio2030dot5[zeroconf]' for discovery
 ```
 
-Python 3.12 or newer. The only required dependency is `cryptography`.
+Python 3.12 or newer. The only required dependency is `cryptography`. The public API is what the package root
+exports (`from aio2030dot5 import ...`, plus `aio2030dot5.locate` for discovery); submodules are internal.
 
 ## Usage
 
@@ -77,18 +90,27 @@ snap.values["energy_summation_delivered"]  # Wh imported
 snap.tou["energy_tou_summation_delivered"]  # {tier: Measurement}; tier 0 is the total
 
 ch = profile.find(Quantity.ENERGY, Statistic.INTERVAL, Direction.DELIVERED)
-await meter.read_latest_intervals(ch)  # completed 15-minute intervals of the newest set
+await meter.read_latest_intervals(ch)  # completed 15-minute intervals of the newest two sets
 ```
 
 Without a fixed address (the `zeroconf` extra):
 
 ```python
 from zeroconf.asyncio import AsyncZeroconf
+from aio2030dot5 import Meter, canonical_sfdi, load_identity
 from aio2030dot5.locate import async_locate
 
-adv = await async_locate(AsyncZeroconf(), "123456789014")  # the meter's SFDI
-meter = Meter(adv.host, ctx, adv.port, expected_lfdi=lfdi)  # the connection proves it is that meter
-profile = await meter.discover(dcap_path=adv.dcap_path)
+identity = load_identity(cert_pem, key_pem)
+async with AsyncZeroconf() as aiozc:  # or your application's shared instance
+    adv = await async_locate(aiozc, "123456789014")  # the meter's SFDI, as printed on it or its portal
+if adv is None:
+    raise SystemExit("meter not heard on the network")
+
+# First contact: check that the device is the one advertised, then pin its LFDI.
+peer = await (await Meter.create(adv.host, identity, adv.port)).probe_tls()
+assert canonical_sfdi(peer.sfdi) == adv.sfdi
+meter = await Meter.create(adv.host, identity, adv.port, expected_lfdi=peer.lfdi, dcap_path=adv.dcap_path)
+profile = await meter.discover()  # every connection now proves it is that meter
 ```
 
 From the command line:
@@ -108,7 +130,7 @@ from aio2030dot5 import Identity, Meter, MeterAuthError, generate_identity, load
 identity = await hass.async_add_executor_job(generate_identity)  # or load_identity(cert, key) from a form
 entry_data = {"identity": identity.to_dict(), "sfdi": adv.sfdi}  # secret: redact with REDACT_KEYS
 
-meter = await Meter.create(host, Identity.from_dict(entry_data["identity"]), dcap_path=adv.dcap_path)
+meter = await Meter.create(adv.host, Identity.from_dict(entry_data["identity"]), adv.port, dcap_path=adv.dcap_path)
 peer = await meter.probe_tls()  # who is there, even before registration
 if peer.client_accepted:
     info = await meter.probe()  # 1-3 GETs: lFDI/sFDI, manufacturer, model, serial, versions
@@ -127,8 +149,8 @@ if peer.client_accepted:
 - **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
 - **`MeterProfile`** also keeps what the meter says it is (`model`, `serial_number`, `hardware_version`), None where the
   meter leaves them empty, as Itron does.
-- **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, `MeterInfo` and `Identity`, for test
-  fixtures and diagnostics.
+- **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, profiles, `MeterInfo`, `Identity` and
+  `ReadingGuard`, for caches, test fixtures and diagnostics.
 
 ## Client identity
 
@@ -144,11 +166,22 @@ These certificates have a 3-year life.
 
 ## Tests
 
-The tests run against **responses captured from a real meter** (agent 3.2.50, with its identifiers
-anonymised), served by a fake meter that speaks the same TLS profile and models the idle timeout,
-paging and session resumption.
+The tests run against **responses captured from a real meter**: the author's own Itron Gen5 Riva (agent 3.2.50),
+with its device identifiers replaced; the readings are real. A fake meter serves them over the same TLS profile and
+models the idle timeout, paging and session resumption.
 
 ```
-uv run pytest            # or: pip install -e . --group dev && pytest
-uv run ruff check && uv run mypy src
+uv run pytest            # or, with pip 25.1+: pip install -e . --group dev && pytest
+uv run ruff check && uv run ruff format --check && uv run mypy src
 ```
+
+## Provenance
+
+Written from the IEEE 2030.5 standard, observations of the author's own meter, and facts learned from Xcel Energy's
+Launchpad SDK, which the author was given access to. No code was copied from the SDK or from any vendor. This
+project is not affiliated with or endorsed by Xcel Energy or Itron.
+
+## Authorship
+
+Written by Raul E Rangel with [Claude](https://claude.com/claude-code) (Anthropic) as a co-author; commits it helped
+write carry a `Co-Authored-By: Claude` trailer. Licensed under the Apache License 2.0 (see LICENSE and NOTICE).

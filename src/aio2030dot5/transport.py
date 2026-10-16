@@ -1069,3 +1069,14 @@ def _request_target(path: str) -> str:
 
 def _host_header(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+# The public names; everything else here is internal.
+__all__ = [
+    "PeerCertificate",
+    "Timeouts",
+    "TransportStats",
+    "async_build_ssl_context",
+    "build_ssl_context",
+    "build_ssl_context_from_pem",
+]

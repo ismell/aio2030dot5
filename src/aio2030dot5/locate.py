@@ -91,3 +91,10 @@ async def _resolve(aiozc: AsyncZeroconf, name: str) -> Advertisement | None:
     except MeterProtocolError as err:
         _LOGGER.debug("ignoring %s: %s", name, err)
         return None
+
+
+# The public names; everything else here is internal.
+__all__ = [
+    "async_browse",
+    "async_locate",
+]

@@ -134,9 +134,9 @@ def classify(
     Description rules exist because Itron agents publish ReadingTypes that
     are not distinguishable on their own: before 3.2.50 the ToU and plain
     summation registers have identical ReadingTypes, and older v3 agents
-    give "WH Net (Interval)" flowDirection 1 (delivered). Itron's own SDK
-    tells them apart by description the same way. Descriptions are free text,
-    so other vendors' are not interpreted.
+    give "WH Net (Interval)" flowDirection 1 (delivered). Xcel Energy's
+    Launchpad SDK tells them apart by description the same way. Descriptions
+    are free text, so other vendors' are not interpreted.
     """
     quantity = _QUANTITY_BY_UOM.get(Uom(rt.uom), Quantity.OTHER)
     direction = _DIRECTION.get(FlowDirection(rt.flow_direction), Direction.NONE)
@@ -298,6 +298,7 @@ class MeterProfile:
         return matches[0] if matches else None
 
     def channel(self, key: str) -> Channel | None:
+        """The channel with this key, or None."""
         return next((c for c in self.channels if c.key == key), None)
 
     def to_dict(self) -> dict[str, Any]:
@@ -671,3 +672,16 @@ async def _discover_tou(
     readings = [Reading.from_xml(e) for e in elems]
     tiers = tuple(sorted({r.tou_tier for r in readings if r.tou_tier is not None and r.raw_value is not None}))
     return list_href, tiers, any(r.tou_tier is not None for r in readings)
+
+
+# The public names; everything else here is internal.
+__all__ = [
+    "KEY_SCHEME",
+    "PROFILE_VERSION",
+    "Channel",
+    "Direction",
+    "MeterInfo",
+    "MeterProfile",
+    "Quantity",
+    "Statistic",
+]

@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.4.0
+## 0.4.0 (first release on PyPI)
+
+Changes since the last pre-release (0.3.3):
+
 - `ReadingGuard.accept(snapshot, profile, now=None)` filters a whole `MeterSnapshot`: readings the meter flags
   questionable and reads that failed become None, summation channels and ToU tiers go through `register()`, power
   through `power()`. It returns `AcceptedReadings(values, tou)`. Consumers no longer re-implement this policy.
@@ -35,22 +38,34 @@
 - `PeerCertificate` leaves the DER out of `repr()`. Non-ASCII PEM raises `InvalidIdentity` without carrying the
   key text in the exception's context, and non-text PEM arguments are refused before any allocation.
 - `async_locate()` accepts `str | int` and normalises with `canonical_sfdi()`.
+- The command line: `discover` always walks the meter and rewrites `--profile`; `read` and `intervals` use the
+  cache and rediscover if it is stale or corrupt; mistakes give a one-line error instead of a traceback; the
+  profile and a generated key are written with mode 0600; `identity` also prints the LFDI as utility portals
+  accept it; help texts, defaults and `--version`.
+- Every module declares `__all__`; the public API is what the package root exports.
+- Documentation: the exception hierarchy and catch order, the real per-request timeout bounds, runnable
+  zeroconf and Home Assistant examples, how the meter is authenticated (LFDI pinning, trust on first use), the
+  provenance of the library and its authorship.
 - Packaging: authors and project URLs, a `dev` dependency group (`uv run pytest`), NOTICE and SECURITY.md.
 
-## 0.3.3
+## Pre-releases
+
+0.3.0 to 0.3.3 were tagged in git but never published.
+
+### 0.3.3
 - `format_lfdi()` accepts any grouping, case and surrounding whitespace, and raises `ValueError` unless 40 hex
   digits remain, instead of grouping whatever it was given.
 - `MeterProfile.from_dict()` type-checks every optional string field (a malformed cache is a `ProfileError`) and
   treats blank strings as None.
 
-## 0.3.2
+### 0.3.2
 - `format_lfdi()` groups an LFDI in fives (`431ED-86C1F-…`). Xcel Energy's portal rejects groups of four.
 
-## 0.3.1
+### 0.3.1
 - `MeterProfile` keeps the meter's `model`, `serial_number` and `hardware_version` from DeviceInformation (None when
   empty). Profiles cached by older versions still load; `PROFILE_VERSION` is unchanged.
 
-## 0.3.0
+### 0.3.0
 - `ReadingGuard`; the per-meter lock is keyed by resolved address; `format_lfdi()`; `manufacturer_name()`.
 
-Earlier versions: see the git history.
+Earlier work: see the git history.

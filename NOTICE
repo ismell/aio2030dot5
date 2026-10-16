@@ -3,5 +3,10 @@ Copyright 2026 Raul E Rangel
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-It was written from the IEEE 2030.5 standard and from observations of meters on
-the author's own network. It contains no code from any meter vendor or utility.
+It was written independently from the IEEE 2030.5 standard, observations of the
+author's own meter, and facts learned from Xcel Energy's Launchpad SDK, which
+the author was given access to. It contains no code from the SDK or from any
+meter vendor or utility. This project is not affiliated with or endorsed by
+Xcel Energy or Itron.
+
+Written by Raul E Rangel with Claude (Anthropic) as a co-author.
