@@ -118,9 +118,12 @@ if peer.client_accepted:
   another reader never counts against it.
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
-  faster than the service allows. It rebases on consistent new series, and records register resets in `.resets`.
+  faster than the service allows (a net register may fall, at that rate). It adopts a new series only once it has
+  lasted (an hour upward, a day downward), records every adoption in `.rebases` and downward ones in `.resets`, so a
+  consumer can start a new accumulation cycle instead of booking the step.
   `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with the meter's own "questionable"
-  flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.as_dict()` between restarts.
+  flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.to_dict()` and restore it with
+  `ReadingGuard.from_dict(data)`.
 - **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
 - **`MeterProfile`** also keeps what the meter says it is (`model`, `serial_number`, `hardware_version`), None where the
   meter leaves them empty, as Itron does.

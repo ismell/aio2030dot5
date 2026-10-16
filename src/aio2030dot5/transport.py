@@ -146,7 +146,7 @@ class TransportStats:
     failures: int = 0
     last_handshake_ms: int | None = None
 
-    def as_dict(self) -> dict[str, int | None]:
+    def to_dict(self) -> dict[str, int | None]:
         return {
             "requests": self.requests,
             "connections": self.connections,

@@ -85,7 +85,7 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"error: {type(err).__name__}: {err}", file=sys.stderr)
         return 1
     finally:
-        print(f"transport: {meter.stats.as_dict()}", file=sys.stderr)
+        print(f"transport: {meter.stats.to_dict()}", file=sys.stderr)
     return 0
 
 
