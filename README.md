@@ -55,6 +55,14 @@ This library is designed around that:
   - `parse_advertisement()` reads an advertisement that a zeroconf library resolved.
   - With the `zeroconf` extra, `aio2030dot5.locate.async_locate(aiozc, sfdi)` finds the meter's current address.
 
+## Install
+
+```
+pip install aio2030dot5               # or aio2030dot5[zeroconf] for discovery
+```
+
+Python 3.12 or newer. The only required dependency is `cryptography`.
+
 ## Usage
 
 ```python
@@ -136,5 +144,6 @@ anonymised), served by a fake meter that speaks the same TLS profile and models 
 paging and session resumption.
 
 ```
-pip install -e '.[zeroconf]' pytest pytest-asyncio && pytest
+uv run pytest            # or: pip install -e . --group dev && pytest
+uv run ruff check && uv run mypy src
 ```

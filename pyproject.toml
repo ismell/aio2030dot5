@@ -8,23 +8,51 @@ dynamic = ["version"]
 description = "Async client for IEEE 2030.5 (SEP 2.0) HAN smart meters, e.g. Itron Gen5 Riva (Xcel Energy Launchpad)"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Raul E Rangel", email = "raul@bestmail.us" }]
 requires-python = ">=3.12"
 dependencies = ["cryptography>=43"]
+keywords = ["ieee 2030.5", "sep2", "smart energy", "smart meter", "han", "itron", "home assistant"]
 classifiers = [
+  "Development Status :: 4 - Beta",
   "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Home Automation",
+  "Topic :: System :: Networking",
   "Typing :: Typed",
 ]
 
+[project.urls]
+Homepage = "https://github.com/ismell/aio2030dot5"
+Issues = "https://github.com/ismell/aio2030dot5/issues"
+Changelog = "https://github.com/ismell/aio2030dot5/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 zeroconf = ["zeroconf>=0.130"]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.13",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.8",
+  "zeroconf>=0.130",
+]
 
 [tool.hatch.version]
 path = "src/aio2030dot5/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aio2030dot5"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
