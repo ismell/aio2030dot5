@@ -28,6 +28,7 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 
 from .dnssd import SERVICE_TYPE, Advertisement, parse_advertisement
 from .exceptions import MeterProtocolError
+from .identity import canonical_sfdi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,10 +40,11 @@ async def async_browse(aiozc: AsyncZeroconf, *, listen: float = 5.0) -> list[Adv
     return await _browse(aiozc, listen, None)
 
 
-async def async_locate(aiozc: AsyncZeroconf, sfdi: str, *, listen: float = 5.0) -> Advertisement | None:
+async def async_locate(aiozc: AsyncZeroconf, sfdi: str | int, *, listen: float = 5.0) -> Advertisement | None:
     """The advertisement whose instance name carries ``sfdi``, or None if it
-    is not heard within ``listen`` seconds. Returns as soon as it is found."""
-    found = await _browse(aiozc, listen, str(int(str(sfdi))))
+    is not heard within ``listen`` seconds. Returns as soon as it is found.
+    ``ValueError`` if ``sfdi`` is not an SFDI (decimal digits)."""
+    found = await _browse(aiozc, listen, canonical_sfdi(sfdi))
     return found[0] if found else None
 
 

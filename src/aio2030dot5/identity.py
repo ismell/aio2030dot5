@@ -203,10 +203,11 @@ def load_identity(
     blobs = []
     for value, what in ((cert_pem, "certificate"), (key_pem, "private key")):
         if isinstance(value, str):
-            try:
-                value = value.encode("ascii")
-            except UnicodeEncodeError:
-                raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",)) from None
+            # Checked rather than caught: a UnicodeEncodeError would carry the
+            # key text along in its context.
+            if not value.isascii():
+                raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",))
+            value = value.encode("ascii")
         if not isinstance(value, bytes):
             raise InvalidIdentity(f"the {what} must be PEM text", (f"{what} is missing",))
         blobs.append(value)

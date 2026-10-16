@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .exceptions import MeterProtocolError
+from .exceptions import MeterProtocolError, ProfileError
 
 
 class Uom(enum.IntEnum):
@@ -113,11 +113,27 @@ UNIT_SYMBOLS: dict[Uom, str] = {
 # -- XML helpers --------------------------------------------------------------
 
 
+_DOCTYPE = ("<!DOCTYPE", "<!ENTITY")
+_DOCTYPE_BYTES = tuple(m.encode(enc) for m in _DOCTYPE for enc in ("ascii", "utf-16-le", "utf-16-be"))
+MAX_TEXT = 1024  # no 2030.5 text element is longer than a few dozen characters
+
+
 def parse_xml(body: bytes | str) -> ET.Element:
+    """Parse a resource. A document type declaration is refused outright: no
+    2030.5 resource has one, and internal entities would let a device inflate
+    a capped response by orders of magnitude."""
+    if any(m in body for m in (_DOCTYPE if isinstance(body, str) else _DOCTYPE_BYTES)):  # type: ignore[operator]
+        raise MeterProtocolError("XML from meter has a document type declaration")
     try:
         return ET.fromstring(body)
     except ET.ParseError as err:
         raise MeterProtocolError(f"malformed XML from meter: {err}") from err
+
+
+def short(value: object, limit: int = 64) -> str:
+    """Device text for an error message: repr'd and cut to ``limit`` characters."""
+    text = repr(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def local_name(tag: str) -> str:
@@ -136,10 +152,11 @@ def children(elem: ET.Element, name: str) -> list[ET.Element]:
 
 
 def text(elem: ET.Element, name: str) -> str | None:
+    """A child element's text, stripped and at most ``MAX_TEXT`` characters."""
     c = child(elem, name)
     if c is None or c.text is None:
         return None
-    t = c.text.strip()
+    t = c.text.strip()[:MAX_TEXT]
     return t or None
 
 
@@ -150,7 +167,7 @@ def int_or_none(elem: ET.Element, name: str) -> int | None:
     try:
         return int(t)
     except ValueError as err:
-        raise MeterProtocolError(f"<{name}> is not an integer: {t!r}") from err
+        raise MeterProtocolError(f"<{name}> is not an integer: {short(t)}") from err
 
 
 def link(elem: ET.Element, name: str) -> str | None:
@@ -179,22 +196,31 @@ def int_attr(elem: ET.Element, name: str, default: int = 0) -> int:
     try:
         return int(raw)
     except ValueError as err:
-        raise MeterProtocolError(f"attribute {name}={raw!r} is not an integer") from err
+        raise MeterProtocolError(f"attribute {name}={short(raw)} is not an integer") from err
 
 
-_HEX = re.compile(r"[0-9A-Fa-f]{1,16}")
+_HEX = re.compile(r"[0-9A-Fa-f]+")
 
 
-def hex_or_none(value: str | None, what: str) -> int | None:
-    """Strict hexBinary: digits only -- no sign, prefix or padding."""
+def hex_or_none(value: str | None, what: str, digits: int = 16) -> int | None:
+    """Strict hexBinary of at most ``digits`` hex digits: no sign, prefix or padding."""
     if value is None:
         return None
-    if not _HEX.fullmatch(value):
-        raise MeterProtocolError(f"{what} {value!r} is not hexBinary")
+    if len(value) > digits or not _HEX.fullmatch(value):
+        raise MeterProtocolError(f"{what} {short(value)} is not hexBinary of up to {digits} digits")
     return int(value, 16)
 
 
 INT48 = 2**47  # Reading values are Int48
+UINT32 = 2**32  # durations and interval lengths, in seconds
+
+
+def add_seconds(start: datetime, seconds: int) -> datetime:
+    """``start`` plus ``seconds``, or MeterProtocolError past the calendar's end."""
+    try:
+        return start + timedelta(seconds=seconds)
+    except OverflowError as err:
+        raise MeterProtocolError(f"{start.isoformat()} + {seconds} s is out of range") from err
 
 
 def int_in_range(elem: ET.Element, name: str, lo: int, hi: int) -> int | None:
@@ -425,7 +451,7 @@ class ReadingType:
         expect_root(root, "ReadingType")
         values: dict[str, int | None] = {attr: int_or_none(root, tag) or 0 for attr, tag in cls._FIELDS}
         values["power_of_ten_multiplier"] = int_in_range(root, "powerOfTenMultiplier", -128, 128) or 0  # Int8
-        values["interval_length"] = int_or_none(root, "intervalLength")
+        values["interval_length"] = int_in_range(root, "intervalLength", 0, UINT32)
         return cls(**values)  # type: ignore[arg-type]
 
     @property
@@ -446,9 +472,23 @@ class ReadingType:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, int | None]) -> ReadingType:
-        values: dict[str, int | None] = {attr: int(d.get(tag) or 0) for attr, tag in cls._FIELDS}
-        values["interval_length"] = d.get("intervalLength")
+    def from_dict(cls, d: Mapping[str, int | None]) -> ReadingType:
+        """Restore :meth:`to_dict` output, checked like :meth:`from_xml`;
+        ``ProfileError`` if it is not (a cached profile from elsewhere)."""
+
+        def field(tag: str, lo: int, hi: int, default: int | None = 0) -> int | None:
+            value = d.get(tag)
+            if value is None:
+                return default
+            if not isinstance(value, int) or isinstance(value, bool) or not lo <= value < hi:
+                raise ProfileError(f"cached ReadingType has a bad {tag}: {short(value)}")
+            return value
+
+        values: dict[str, int | None] = {
+            attr: field(tag, -128, 128) if attr == "power_of_ten_multiplier" else field(tag, 0, UINT32)
+            for attr, tag in cls._FIELDS
+        }
+        values["interval_length"] = field("intervalLength", 0, UINT32, None)
         return cls(**values)  # type: ignore[arg-type]
 
 
@@ -471,17 +511,17 @@ class Reading:
         start = duration = None
         if period is not None:
             start = int_or_none(period, "start")
-            duration = int_or_none(period, "duration")
-        quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags")
+            duration = int_in_range(period, "duration", 0, UINT32)
+        quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags", 4)
         return cls(
             href=elem.get("href"),
             raw_value=int_in_range(elem, "value", -INT48, INT48),
             start=epoch(start),
             duration=duration,
-            tou_tier=int_or_none(elem, "touTier"),
+            tou_tier=int_in_range(elem, "touTier", 0, 256),  # UInt8
             quality=QualityFlags(quality) if quality is not None else None,
-            # localID is hexBinary in the schema ("2F" for slot 47).
-            local_id=hex_or_none(text(elem, "localID"), "localID"),
+            # localID is HexBinary16 in the schema ("2F" for slot 47).
+            local_id=hex_or_none(text(elem, "localID"), "localID", 4),
         )
 
 
@@ -501,7 +541,7 @@ class ReadingSetInfo:
         start = duration = None
         if period is not None:
             start = int_or_none(period, "start")
-            duration = int_or_none(period, "duration")
+            duration = int_in_range(period, "duration", 0, UINT32)
         rl = child(elem, "ReadingListLink")
         return cls(
             href=elem.get("href", ""),
@@ -616,13 +656,13 @@ def interval_values(
     length = reading_type.interval_length
     if not length:
         raise MeterProtocolError("interval ReadingType has no intervalLength")
-    set_end = reading_set.start + timedelta(seconds=reading_set.duration) if reading_set.duration else None
+    set_end = add_seconds(reading_set.start, reading_set.duration) if reading_set.duration else None
     out = []
     for r in readings:
         if r.start is not None:
             start = r.start
         elif r.local_id is not None:
-            start = reading_set.start + timedelta(seconds=r.local_id * length)
+            start = add_seconds(reading_set.start, r.local_id * length)
         else:
             continue
         # A slot outside its own set (an agent numbering localID globally, a
@@ -632,7 +672,7 @@ def interval_values(
         out.append(
             IntervalValue(
                 start=start,
-                end=start + timedelta(seconds=r.duration or length),
+                end=add_seconds(start, r.duration or length),
                 value=reading_type.scale(r.raw_value),
                 unit=reading_type.unit,
                 uom=reading_type.uom,

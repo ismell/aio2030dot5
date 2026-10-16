@@ -16,6 +16,7 @@ from __future__ import annotations
 import enum
 import logging
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -382,6 +383,11 @@ def _paged(href: str, start: int, limit: int) -> str:
     return f"{href}{sep}s={start}&l={limit}"
 
 
+# An Itron agent's longest list is 60 ReadingSets, or 48 Readings in a set.
+MAX_LIST_ITEMS = 2000
+MAX_LIST_PAGES = 200
+
+
 async def get_list(
     batch: Batch, href: str, item: str, *, start: int = 0, limit: int | None = None
 ) -> tuple[ListPage, list[Any]]:
@@ -389,23 +395,36 @@ async def get_list(
 
     Pages are followed by the count actually returned and the list's own
     ``all``: agents return short pages, and a Kitu-based agent's
-    ``ReadingListLink@all`` is stale until the list is fetched once.
+    ``ReadingListLink@all`` is stale until the list is fetched once. A list
+    longer than ``MAX_LIST_ITEMS`` (or needing more than ``MAX_LIST_PAGES``
+    GETs) is refused: no meter holds that many, and following a device's
+    ``all`` blindly could keep the meter's only connection busy for hours.
     """
     items: list[Any] = []
     page: ListPage | None = None
     seen: set[str] = set()
+    pages = 0
     while True:
+        pages += 1
+        if pages > MAX_LIST_PAGES or len(items) > MAX_LIST_ITEMS:
+            raise MeterProtocolError(f"{href} is longer than any meter's list ({len(items)} items so far)")
         want = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(items))
         root = parse_xml(await batch.get(_paged(href, start, want)))
         if not local_name(root.tag).endswith("List"):
             raise MeterProtocolError(f"{href} is not a list (<{local_name(root.tag)}>)")
         page = ListPage.of(root)
-        got = [e for e in children(root, item) if (e.get("href") or id(e)) not in seen]
-        seen.update(e.get("href") or "" for e in got)
+        got = [e for e in children(root, item) if _identity(e) not in seen]
+        seen.update(_identity(e) for e in got)
         items.extend(got)
         start += len(got)
         if not got or start >= page.all or (limit is not None and len(items) >= limit):
             return page, items
+
+
+def _identity(elem: Any) -> str:
+    """What makes a list item the same item on another page: its href, or for
+    an item without one (interval Readings), its content."""
+    return elem.get("href") or ET.tostring(elem, encoding="unicode")
 
 
 # -- keys -----------------------------------------------------------------------
@@ -453,7 +472,7 @@ def assign_keys(entries: list[tuple[MeterReadingInfo, Quantity, Statistic, Direc
 
 def _href_order(info: MeterReadingInfo) -> tuple[int, str]:
     tail = info.href.rstrip("/").rsplit("/", 1)[-1]
-    return (int(tail), info.href) if tail.isdigit() else (1 << 30, info.href)
+    return (int(tail), info.href) if tail.isascii() and tail.isdigit() else (1 << 30, info.href)
 
 
 def _rank_usage_point(p: UsagePoint) -> tuple[int, int, int, int]:

@@ -24,6 +24,17 @@
 - `discover()` pins the first device it reaches for the rest of its walk, so a reconnect cannot mix two devices.
 - A replayed snapshot (`MeterSnapshot.from_dict`) keeps `MeterNotFound` errors as such.
 - `KEY_SCHEME`, `PROFILE_VERSION` and `TIME_ERROR_KEY` are exported from the package root.
+- Hardening against a device that is not a healthy meter (all fail as a typed `MeterError`, quickly, without
+  unbounded memory): chunked framing is bounded at every step (size line, declared size, body, trailers) and
+  sizes must be plain hex; `Content-Length` must be plain digits; an unframed body cut without close_notify is a
+  `MeterConnectionError`; XML with a document type declaration is refused (no entity expansion); element text is
+  clamped to 1024 characters; durations and interval lengths are bounded to UInt32, `localID` to HexBinary16,
+  `touTier` to UInt8, and date arithmetic past the calendar is a `MeterProtocolError`; lists longer than any
+  meter's (`MAX_LIST_ITEMS`, `MAX_LIST_PAGES`) are refused, and repeated href-less items end the walk; a
+  tampered cached `ReadingType` is a `ProfileError`. Device text in error messages is truncated.
+- `PeerCertificate` leaves the DER out of `repr()`. Non-ASCII PEM raises `InvalidIdentity` without carrying the
+  key text in the exception's context, and non-text PEM arguments are refused before any allocation.
+- `async_locate()` accepts `str | int` and normalises with `canonical_sfdi()`.
 - Packaging: authors and project URLs, a `dev` dependency group (`uv run pytest`), NOTICE and SECURITY.md.
 
 ## 0.3.3

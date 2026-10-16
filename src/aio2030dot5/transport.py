@@ -46,6 +46,7 @@ from .exceptions import (
     MeterTimeout,
 )
 from .identity import Identity, lfdi_from_der, sfdi_from_lfdi
+from .models import short
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +55,10 @@ CONTENT_TYPE = "application/sep+xml"
 _READ_SIZE = 16384
 _MAX_HEADER_BYTES = 16384
 _MAX_BODY_BYTES = 4 * 1024 * 1024
+_MAX_CHUNK_LINE_BYTES = 1024
+_COMPACT_AFTER = 256 * 1024
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
+_CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")
 
 
 def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
@@ -91,10 +96,16 @@ def build_ssl_context_from_pem(cert_pem: str | bytes, key_pem: str | bytes) -> s
     fresh private directory (mode 0700, files 0600) that is removed before
     this returns, so the key is on disk only for the duration of the call.
     """
-    try:
-        blobs = [p.encode("ascii") if isinstance(p, str) else bytes(p) for p in (cert_pem, key_pem)]
-    except (UnicodeEncodeError, TypeError):
-        raise InvalidIdentity("PEM text must be ASCII", ("PEM text must be ASCII",)) from None
+    blobs = []
+    for p in (cert_pem, key_pem):
+        # Checked rather than caught: a UnicodeEncodeError would carry the key
+        # text along in its context.
+        if isinstance(p, str) and p.isascii():
+            blobs.append(p.encode("ascii"))
+        elif isinstance(p, bytes | bytearray | memoryview):
+            blobs.append(bytes(p))
+        else:
+            raise InvalidIdentity("PEM text must be ASCII str or bytes", ("PEM text must be ASCII",))
     with tempfile.TemporaryDirectory(prefix="aio2030dot5-") as tmp:
         paths = []
         for name, blob in zip(("cert.pem", "key.pem"), blobs, strict=True):
@@ -178,8 +189,10 @@ class PeerCertificate:
     name. It is not verified against a CA -- pin it (trust on first use).
     """
 
-    der: bytes  # the leaf (device) certificate
-    chain: tuple[bytes, ...]  # as sent, leaf first; just the leaf on a resumed session
+    # Left out of repr(): the DER is kilobytes, and a meter's certificate can
+    # carry a hardware serial number that does not belong in logs.
+    der: bytes = field(repr=False)  # the leaf (device) certificate
+    chain: tuple[bytes, ...] = field(repr=False)  # as sent, leaf first; just the leaf on a resumed session
     lfdi: str
     sfdi: str
 
@@ -286,6 +299,7 @@ class _TlsConnection:
         self._tap = tap  # fed raw bytes until the handshake ends
         self._buffer = b""
         self.eof = False
+        self.truncated = False
         self.requests = 0
         self.last_used = time.monotonic()
 
@@ -415,8 +429,11 @@ class _TlsConnection:
                 # On EOF, loop once more so the engine can report close_notify
                 # (b"" above) or a truncated stream (SSLEOFError below).
                 await self._feed()
-            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+            except ssl.SSLZeroReturnError:
                 self.eof = True
+                return b""
+            except ssl.SSLEOFError:
+                self.eof = self.truncated = True  # TCP FIN without close_notify
                 return b""
             except ssl.SSLError as err:
                 # Agents that let an unregistered client finish the handshake
@@ -446,7 +463,7 @@ class _TlsConnection:
             version, status_text, *reason = lines[0].split(" ", 2)
             status = int(status_text)
         except ValueError as err:
-            raise MeterProtocolError(f"bad HTTP status line: {lines[0]!r}") from err
+            raise MeterProtocolError(f"bad HTTP status line: {short(lines[0])}") from err
         headers: dict[str, str] = {}
         for line in lines[1:]:
             name, sep, value = line.partition(":")
@@ -467,11 +484,10 @@ class _TlsConnection:
             # Chunked framing wins over Content-Length (RFC 9112 section 6.3).
             body, self._buffer = await self._read_chunked(rest)
         elif "content-length" in headers:
-            try:
-                length = int(headers["content-length"])
-            except ValueError as err:
-                raise MeterProtocolError("bad Content-Length") from err
-            if length < 0 or length > _MAX_BODY_BYTES:
+            if not _CONTENT_LENGTH.fullmatch(headers["content-length"]):
+                raise MeterProtocolError(f"bad Content-Length {short(headers['content-length'])}")
+            length = int(headers["content-length"])
+            if length > _MAX_BODY_BYTES:
                 raise MeterProtocolError(f"bad Content-Length {length}")
             while len(rest) < length:
                 chunk = await self._recv_some()
@@ -488,43 +504,75 @@ class _TlsConnection:
                 rest += chunk
                 if len(rest) > _MAX_BODY_BYTES:
                     raise MeterProtocolError("HTTP body too large")
+            if self.truncated:
+                # EOF is the only framing here, so an EOF without close_notify
+                # may have cut the body short.
+                raise MeterConnectionError("meter closed the connection without close_notify mid-body")
             body, self._buffer, keep_alive = rest, b"", False
 
         return Response(status, reason[0] if reason else "", headers, body, keep_alive and not self.eof)
 
     async def _read_chunked(self, rest: bytes) -> tuple[bytes, bytes]:
-        body = b""
+        """Decode a chunked body, bounded at every step: the size line, the
+        declared size, the body and the trailers. ``buf`` grows in place and
+        each search starts near the new data, so a slow meter costs linear work."""
+        buf = bytearray(rest)
+        body = bytearray()
+        pos = 0  # start of the unread part of buf
         while True:
-            while b"\r\n" not in rest:
-                chunk = await self._recv_some()
-                if not chunk:
-                    raise MeterConnectionError("meter closed the connection mid-chunk")
-                rest += chunk
-            size_line, rest = rest.split(b"\r\n", 1)
-            try:
-                size = int(size_line.split(b";")[0], 16)
-            except ValueError as err:
-                raise MeterProtocolError("bad chunk size") from err
-            if size < 0:
-                raise MeterProtocolError("negative chunk size")
-            while len(rest) < size + 2:
-                chunk = await self._recv_some()
-                if not chunk:
-                    raise MeterConnectionError("meter closed the connection mid-chunk")
-                rest += chunk
-            if size == 0:
-                # Skip optional trailers up to the terminating blank line.
-                while not rest.startswith(b"\r\n") and b"\r\n\r\n" not in rest:
-                    chunk = await self._recv_some()
-                    if not chunk:
-                        raise MeterConnectionError("meter closed the connection mid-trailer")
-                    rest += chunk
-                end = 2 if rest.startswith(b"\r\n") else rest.index(b"\r\n\r\n") + 4
-                return body, rest[end:]
-            body += rest[:size]
-            if len(body) > _MAX_BODY_BYTES:
+            line_end = await self._fill_until(buf, b"\r\n", pos, _MAX_CHUNK_LINE_BYTES, "chunk size line")
+            size_field = bytes(buf[pos:line_end]).split(b";", 1)[0].strip(b" \t")
+            if not _CHUNK_SIZE.fullmatch(size_field):
+                raise MeterProtocolError(f"bad chunk size {short(size_field)}")
+            size = int(size_field, 16)
+            if size > _MAX_BODY_BYTES - len(body):
                 raise MeterProtocolError("HTTP body too large")
-            rest = rest[size + 2 :]
+            pos = line_end + 2
+            if size == 0:
+                # Optional trailers, up to the blank line that ends the message.
+                if not await self._fill_upto(buf, pos, 2):
+                    raise MeterConnectionError("meter closed the connection mid-trailer")
+                if buf[pos : pos + 2] == b"\r\n":
+                    return bytes(body), bytes(buf[pos + 2 :])
+                end = await self._fill_until(buf, b"\r\n\r\n", pos, _MAX_HEADER_BYTES, "chunked trailers")
+                return bytes(body), bytes(buf[end + 4 :])
+            while len(buf) < pos + size + 2:
+                chunk = await self._recv_some()
+                if not chunk:
+                    raise MeterConnectionError("meter closed the connection mid-chunk")
+                buf += chunk
+            if buf[pos + size : pos + size + 2] != b"\r\n":
+                raise MeterProtocolError("chunk not terminated by CRLF")
+            body += buf[pos : pos + size]
+            pos += size + 2
+            if pos > _COMPACT_AFTER:  # drop what has been consumed
+                del buf[:pos]
+                pos = 0
+
+    async def _fill_until(self, buf: bytearray, marker: bytes, start: int, limit: int, what: str) -> int:
+        """Read until ``marker`` appears in ``buf`` at or after ``start``, at
+        most ``limit`` bytes past it; the marker's index."""
+        searched = start
+        while True:
+            found = buf.find(marker, searched)
+            if found >= 0:
+                return found
+            if len(buf) - start > limit:
+                raise MeterProtocolError(f"{what} too long")
+            searched = max(start, len(buf) - len(marker) + 1)
+            chunk = await self._recv_some()
+            if not chunk:
+                raise MeterConnectionError(f"meter closed the connection mid-{what}")
+            buf += chunk
+
+    async def _fill_upto(self, buf: bytearray, start: int, count: int) -> bool:
+        """Read until ``buf`` holds ``count`` bytes past ``start``; False at EOF."""
+        while len(buf) < start + count:
+            chunk = await self._recv_some()
+            if not chunk:
+                return False
+            buf += chunk
+        return True
 
     async def close(self) -> None:
         """Send close_notify and close. Never raises; even if cancelled
