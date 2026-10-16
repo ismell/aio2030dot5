@@ -81,13 +81,14 @@ def _series(guard: ReadingGuard, values: list[float], start: float, step: float)
     return [guard.register("r", v, start + step * (i + 1)) for i, v in enumerate(values)]
 
 
-def test_a_consistent_new_series_above_is_adopted_after_an_hour() -> None:
+def test_a_consistent_new_series_above_is_adopted_after_a_day() -> None:
+    """Upward as downward: a real change happens once in a meter's life, while an
+    adopted glitch would stay in a consumer's statistics for good."""
     guard = ReadingGuard()
     guard.register("r", 1_000.0, NOW)
-    results = _series(guard, [9e9 + 10 * i for i in range(62)], NOW, 60.0)
-    assert results[:60] == [None] * 60  # three reads are not enough: it has to last an hour
-    assert results[60] == 9e9 + 600
-    assert guard.rebases == {"r": NOW + 61 * 60} and guard.resets == {}
+    results = _series(guard, [9e9 + 10 * i for i in range(100)], NOW, QUARTER)
+    assert results[:96] == [None] * 96 and results[96] == 9e9 + 960
+    assert guard.rebases == {"r": NOW + 97 * QUARTER} and guard.resets == {}
 
 
 def test_a_stuck_spike_shorter_than_the_confirmation_is_never_adopted() -> None:
@@ -121,14 +122,14 @@ def test_a_drop_lasting_a_day_is_a_reset_and_the_old_series_can_return() -> None
     assert guard.rebases["r"] == t and "r" not in guard.displaced
 
 
-def test_a_stuck_high_value_adopted_after_an_hour_gives_way_to_the_real_register() -> None:
+def test_a_stuck_high_value_adopted_after_a_day_gives_way_to_the_real_register() -> None:
     guard = ReadingGuard()
     guard.register("r", LIFETIME, NOW)
-    results = _series(guard, [9e9] * 62, NOW, 60.0)  # stuck for an hour: adopted
-    assert results[-1] == 9e9 and guard.rebases["r"] <= NOW + 62 * 60
-    back = guard.register("r", LIFETIME + 50, NOW + 63 * 60)
-    assert back == LIFETIME + 50  # at once, not after a day
-    assert guard.resets == {}  # a return, never a reset
+    results = _series(guard, [9e9] * 100, NOW, QUARTER)  # stuck for a day: adopted
+    assert results[-1] == 9e9 and "r" in guard.rebases
+    t = NOW + 101 * QUARTER
+    assert guard.register("r", LIFETIME + 50, t) == LIFETIME + 50  # back at once, not after a day
+    assert guard.resets == {"r": t}  # a return that steps down is a new cycle
 
 
 def test_a_confirmation_survives_restarts() -> None:
@@ -201,14 +202,14 @@ def test_the_state_survives_a_restart() -> None:
     guard = ReadingGuard()
     guard.register("r", 1_000.0, 0.0)
     guard.resets["r"] = guard.rebases["r"] = 5.0
-    guard.displaced["r"] = (9_000.0, 1.0)
+    guard.displaced["r"] = (9_000.0, 1.0, 2.0)
     data = guard.to_dict()
     data["registers"]["bad"] = "x"
     data["resets"]["worse"] = "y"
     restarted = ReadingGuard.from_dict(data)
     assert restarted.registers == {"r": (1_000.0, 0.0)}
     assert restarted.resets == restarted.rebases == {"r": 5.0}
-    assert restarted.displaced == {"r": (9_000.0, 1.0)}
+    assert restarted.displaced == {"r": (9_000.0, 1.0, 2.0)}
     assert restarted.register("r", 9e9, 60.0) is None
     for junk in (None, [1], {"registers": [1], "resets": 3}):
         assert ReadingGuard.from_dict(junk).registers == {}
@@ -299,7 +300,7 @@ async def test_implausible_values_are_dropped(pki: Pki, fake_meter: FakeMeter) -
     assert total is not None
 
     spiky = _with_value(snapshot, power, value=10_000_000.0)
-    spiky = _with_value(spiky, energy, value=total - 5_000)  # a lifetime register going backwards
+    spiky = _with_value(spiky, energy, value=total - 5e6)  # a lifetime register going far backwards
     accepted = guard.accept(spiky, profile, NOW + 60)
 
     assert accepted.values[power] is None
@@ -315,7 +316,7 @@ async def test_tou_tiers_are_guarded_one_by_one(pki: Pki, fake_meter: FakeMeter)
     guard.accept(snapshot, profile, NOW)
 
     tiers = dict(register.items())
-    tiers[tier] = dataclasses.replace(tiers[tier], value=tiers[tier].value - 5_000)  # type: ignore[operator]
+    tiers[tier] = dataclasses.replace(tiers[tier], value=tiers[tier].value - 5e6)  # type: ignore[operator]
     dropped = dataclasses.replace(snapshot, tou={**snapshot.tou, key: TouRegister(tiers)})
     accepted = guard.accept(dropped, profile, NOW + 60)
 
@@ -429,3 +430,56 @@ def test_a_run_saved_right_after_a_stray_survives_a_restart() -> None:
     guard.register("r", 9e12, NOW + 9 * QUARTER)  # a tolerated stray
     assert guard.pending == ["r"]
     assert ReadingGuard.from_dict(guard.to_dict()).pending == ["r"]
+
+
+def test_after_a_small_accepted_glitch_the_value_is_held_until_the_register_catches_up() -> None:
+    """A glitch within the growth bound cannot be told from real use. The real
+    register then reads a little below it: hold, never decrease, never a reset."""
+    guard = ReadingGuard()
+    guard.register("r", 1_000_000.0, NOW)
+    assert guard.register("r", 1_008_000.0, NOW + QUARTER) == 1_008_000.0  # +8 kWh in 15 min: plausible
+    assert guard.register("r", 1_000_050.0, NOW + 2 * QUARTER) == 1_008_000.0  # the real register: held
+    assert guard.register("r", 1_007_000.0, NOW + 5 * HOUR) == 1_008_000.0
+    assert guard.register("r", 1_009_000.0, NOW + 6 * HOUR) == 1_009_000.0  # caught up
+    assert guard.resets == {} and guard.rejected == 0
+
+
+def test_an_outage_does_not_confirm_a_spike() -> None:
+    """Spike, 70 minutes of silence, spike, spike: no gap counts for more than 2 h,
+    and a run needs a day, so nothing is adopted."""
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    spike = LIFETIME + 4e8
+    for when in (NOW + 60, NOW + 60 + 70 * 60, NOW + 120 + 70 * 60, NOW + 180 + 70 * 60):
+        assert guard.register("r", spike, when) is None
+    restarted = ReadingGuard.from_dict(guard.to_dict())  # nor across a restart
+    assert restarted.register("r", spike, NOW + 65 * 60 + 2 * HOUR) is None
+    assert guard.rebases == {} and restarted.rebases == {}
+
+
+def test_strays_add_no_time_to_a_run() -> None:
+    """20 h of zeros with real reads among them never make a day of zeros."""
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    t = NOW
+    for i in range(1200):  # a minute apart; every fifth read is the real register
+        t += 60
+        value = 0.0 if i % 5 else LIFETIME + i
+        guard.register("r", value, t)
+    assert guard.resets == {}
+
+
+def test_a_net_register_needs_a_day_to_rebase_too() -> None:
+    guard = ReadingGuard()
+    guard.register("net", 5_000_000.0, NOW, monotonic=False)
+    results = [guard.register("net", 0.0, NOW + 60 * (i + 1), monotonic=False) for i in range(120)]
+    assert results == [None] * 120 and guard.rebases == {}  # two hours of zeros: not a new baseline
+
+
+def test_growth_is_allowed_after_the_consumers_clock_steps_back() -> None:
+    guard = ReadingGuard()
+    guard.register("r", 1_000_000.0, NOW)
+    guard.register("r", 1_000_100.0, NOW + 60)
+    # The host reboots with its clock an hour behind; meanwhile the meter counted 1.5 kWh.
+    assert guard.register("r", 1_001_600.0, NOW - HOUR) == 1_001_600.0
+    assert guard.register("r", 1_001_700.0, NOW - HOUR + 60) == 1_001_700.0

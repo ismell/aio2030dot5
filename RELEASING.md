@@ -31,5 +31,6 @@ trusted publishing: no API token exists anywhere.
 
 If the PyPI upload fails halfway (one file uploaded), do not re-run the job: PyPI
 refuses a file that already exists. Download the `dist` artifact from the run and
-upload the missing file with `twine upload` and a short-lived API token, or
+upload the missing file with `twine upload` and an API token scoped to this project
+(delete the token right afterwards), or
 release the next patch version.

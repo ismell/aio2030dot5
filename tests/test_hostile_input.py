@@ -3,6 +3,7 @@ typed MeterError, quickly, and without unbounded memory."""
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import time
 from datetime import UTC, datetime
@@ -310,6 +311,51 @@ async def test_bytes_after_a_response_are_never_served_as_the_next_one(pki: Pki)
         assert connections == 2
 
 
+def _ok(body: bytes) -> bytes:
+    return OK + b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+
+
+@pytest.mark.parametrize(
+    ("after", "separately", "connections"),
+    [
+        (b"\r\n", False, 1),  # a stray blank line, in the response's own TLS record...
+        (b"\r\n", True, 1),  # ...or in a record of its own: kept alive either way
+        (_ok(b"stale"), True, 2),  # a whole extra response: never served
+    ],
+    ids=["blank-line", "blank-line-own-record", "extra-response-own-record"],
+)
+async def test_what_follows_a_response_is_judged_the_same_however_it_arrives(
+    pki: Pki, after: bytes, separately: bool, connections: int
+) -> None:
+    sctx = server_ctx(pki)
+    opened = 0
+
+    def handler(raw):  # type: ignore[no-untyped-def]
+        nonlocal opened
+        opened += 1
+        tls = sctx.wrap_socket(raw, server_side=True)
+        first = opened == 1
+        while (line := read_request(tls)) is not None:
+            body = line.split(" ")[1].encode()
+            if first and separately:
+                tls.sendall(_ok(body))
+                tls.sendall(after)
+            elif first:
+                tls.sendall(_ok(body) + after)
+            else:
+                tls.sendall(_ok(body))
+            first = False
+
+    with Server(handler) as srv:
+        meter = make_meter(pki, srv.port)
+        async with meter._transport.batch() as b:
+            assert await b.get("/a") == b"/a"
+            await asyncio.sleep(0.1)  # whatever followed has reached our socket
+            assert await b.get("/b") == b"/b"
+            assert await b.get("/c") == b"/c"
+        assert opened == connections
+
+
 @pytest.mark.parametrize("line", [b"\r\n", b";ext=1\r\n"])
 async def test_an_empty_chunk_size_is_not_the_last_chunk(pki: Pki, line: bytes) -> None:
     with pytest.raises(MeterProtocolError):
@@ -322,6 +368,17 @@ def test_a_flood_of_attributes_is_refused() -> None:
     attrs = " ".join(f'a{i}="1"' for i in range(MAX_ELEMENTS + 1))
     with pytest.raises(MeterProtocolError):
         parse_xml(f"<R {NS} {attrs}/>")
+
+
+# Only XML's own whitespace is insignificant: a no-break space or an ideographic
+# space is part of the value, and no SFDI.
+@pytest.mark.parametrize("sfdi", ["\u00a0123", "123\u3000", "\u2003123"])
+def test_an_sfdi_wrapped_in_unicode_spaces_is_refused(sfdi: str) -> None:
+    from aio2030dot5.models import SelfDevice
+
+    with pytest.raises(MeterProtocolError):
+        SelfDevice.from_xml(parse_xml(f"<SelfDevice {NS}><sFDI>{sfdi}</sFDI></SelfDevice>"))
+    assert SelfDevice.from_xml(parse_xml(f"<SelfDevice {NS}><sFDI> 0123\n</sFDI></SelfDevice>")).sfdi == "123"
 
 
 # Underscores, Arabic-Indic and fullwidth digits, and a hex prefix are not xs:integer.
@@ -359,3 +416,10 @@ async def test_debug_logs_never_carry_a_whole_lfdi_or_sfdi(
     assert lfdi is not None
     assert lfdi not in caplog.text and sfdi_from_lfdi(lfdi) not in caplog.text
     assert lfdi[-6:] in caplog.text  # the short form is there
+
+
+def test_an_sfdi_in_an_mdns_name_is_logged_by_its_last_three_digits() -> None:
+    from aio2030dot5.locate import _masked
+
+    assert _masked("651057190448._smartenergy._tcp.local.") == "...448._smartenergy._tcp.local."
+    assert _masked("meter-12._smartenergy._tcp.local.") == "meter-12._smartenergy._tcp.local."  # not an SFDI

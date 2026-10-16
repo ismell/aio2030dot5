@@ -20,7 +20,9 @@ This library is designed around that:
   Connections are spaced by a minimum interval, and every read in a batch shares one keep-alive connection.
 - **TLS session resumption.** A full ECDHE-ECDSA handshake costs the meter ~330 ms; a resumed one
   ~60–160 ms. asyncio's TLS transport cannot resume sessions, so TLS runs through `ssl.MemoryBIO`.
-- **Correct HTTP framing.** It reads by Content-Length or chunked framing and never waits for EOF.
+- **Correct HTTP framing.** It reads by Content-Length or chunked framing; only a response with neither is read to
+  the end of the connection, which must then end with close_notify. Requests are never pipelined, and a connection
+  holding anything after its response is not reused.
 - **Policy-free.** There is no polling loop. The only retries are transport-level and bounded:
   - one handshake retry after `BAD_SIGNATURE`;
   - one reconnect when the meter drops a kept-alive connection before answering (GET is idempotent).
@@ -158,23 +160,23 @@ if peer.client_accepted:
   `MeterNotFound` there means the profile is stale.
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
-  faster than the service allows: since the value was first seen, but for no more than 2 h past its last read, so a
-  ToU tier the meter refreshes hourly may step by an hour's worth while a spike after a quiet weekend is still a
-  spike. A net register may move either way at that rate. It adopts a new series only once it has been observed long
-  enough: an hour and 3 reads upward, a day and 12 reads downward (a net register always uses the upward rule), with
-  each gap between reads counting for at most 2 h. All times are your clock, never the meter's. `.rebases` holds the
-  time of each register's latest adoption and `.resets` that of its latest downward one, so a consumer can start a new
-  accumulation cycle instead of booking the step. The module docstring has the full rules.
-  `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with the meter's own "questionable"
-  flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.to_dict()` and restore it with
-  `ReadingGuard.from_dict(data)`.
+  faster than the service allows: since the value was first seen, but for no more than 90 min past its latest
+  accepted read, so a ToU tier the meter refreshes hourly may step by what the time since its last change allows
+  while a spike after a quiet weekend is still a spike. A net register may move either way at that rate. A small
+  dip below an accepted value holds that value. It adopts a new series, in either direction, only after 12
+  consistent reads over a day of observation (each gap between reads counts for at most 2 h). All times are your
+  clock, never the meter's. `.rebases` holds the time of each register's latest adoption and `.resets` that of its
+  latest downward one, so a consumer can start a new accumulation cycle instead of booking the step. The module
+  docstring has the full rules. `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with
+  the meter's own "questionable" flags and failed reads, and returns `AcceptedReadings(values, tou, rebased)`.
+  Persist `guard.to_dict()` and restore it with `ReadingGuard.from_dict(data)`.
 - **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
 - **`MeterProfile`** also keeps what the meter says it is (`model`, `serial_number`, `hardware_version`), None where the
   meter leaves them empty, as Itron does.
 - **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, profiles, `MeterInfo`, `Identity` and
   `ReadingGuard`, for caches, test fixtures and diagnostics. `from_dict()` accepts any mapping and raises
-  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`); `ReadingGuard.from_dict()` skips malformed
-  entries one by one and keeps the rest.
+  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`), except that `ReadingGuard.from_dict()` skips
+  malformed entries one by one and keeps the rest; anything that is not a mapping restores nothing.
 
 ## Client identity
 

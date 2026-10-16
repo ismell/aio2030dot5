@@ -187,7 +187,7 @@ def text(elem: ET.Element, name: str) -> str | None:
     c = child(elem, name)
     if c is None or c.text is None:
         return None
-    t = c.text.strip()[:MAX_TEXT]
+    t = c.text.strip(_XML_SPACE)[:MAX_TEXT]
     return t or None
 
 
@@ -907,9 +907,9 @@ def _from_iso(value: str | None) -> datetime | None:
 
 
 def _sfdi(value: str | None) -> str | None:
-    if value is None or not value.strip():
+    if value is None:
         return None
-    if not value.strip().isascii() or not value.strip().isdigit():
+    if not value.isascii() or not value.isdigit():
         raise MeterProtocolError(f"sFDI is not a number: {value!r}")
     return str(int(value))  # agents may zero-pad it
 

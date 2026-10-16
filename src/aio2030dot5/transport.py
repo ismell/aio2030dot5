@@ -60,6 +60,16 @@ _MAX_TARGET = 2048  # a resolved href plus our paging query
 _COMPACT_AFTER = 256 * 1024
 _CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
 _HEX_DIGITS = re.compile(rb"[0-9A-Fa-f]+")
+_UNREAD_FEEDS = 4  # socket reads before deciding a connection is still clean
+_MAX_BLANK_BYTES = 4  # a stray CRLF or two before a status line is tolerated
+
+
+def _skip_blank_lines(buf: bytes) -> bytes:
+    """Drop a few leading CRLFs: some servers end a body with an extra one."""
+    stripped = buf.lstrip(b"\r\n")
+    return stripped if len(buf) - len(stripped) <= _MAX_BLANK_BYTES else buf
+
+
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")
 
 
@@ -446,12 +456,44 @@ class _TlsConnection:
 
     @property
     def leftover(self) -> int:
-        """Bytes received after the last complete response (none expected)."""
-        return len(self._buffer)
+        """Bytes received after the last complete response (none expected; a
+        stray blank line some servers add after a body does not count)."""
+        return len(_skip_blank_lines(self._buffer))
+
+    async def unread(self) -> bool:
+        """Whether anything arrived that no request asked for.
+
+        Takes in what the socket already holds (without waiting for more) and
+        decrypts it, so the answer does not depend on how the meter split its
+        writes: a stray blank line after a body is fine wherever it lands, an
+        extra response is not. A close or a TLS alert also counts. Bytes still
+        on their way cannot be seen: HTTP/1.1 cannot tell them from the next
+        answer."""
+        for _ in range(_UNREAD_FEEDS):
+            try:
+                async with asyncio.timeout(0):  # expires at the loop's next turn
+                    if not await self._feed():
+                        return True
+            except TimeoutError:
+                break  # nothing more buffered
+        while self._in.pending or self._ssl.pending():
+            try:
+                data = self._ssl.read(_READ_SIZE)
+            except ssl.SSLWantReadError:
+                break  # a partial record (counted below) or a handshake message
+            except ssl.SSLError:
+                return True
+            if not data:
+                self.eof = True
+                return True
+            self._buffer += data
+            if self.leftover:
+                return True
+        return bool(self.leftover or self._in.pending)
 
     async def read_response(self) -> Response:
         """Read exactly one HTTP/1.1 response, framed by its own headers."""
-        buf = self._buffer
+        buf = _skip_blank_lines(self._buffer)
         while b"\r\n\r\n" not in buf:
             if len(buf) > _MAX_HEADER_BYTES:
                 raise MeterProtocolError("HTTP response headers too large")
@@ -465,7 +507,7 @@ class _TlsConnection:
                 raise _EmptyResponse(str(err)) from err
             if not chunk:
                 raise _EmptyResponse() if not buf else MeterConnectionError("meter closed the connection mid-headers")
-            buf += chunk
+            buf = _skip_blank_lines(buf + chunk)
         head, rest = buf.split(b"\r\n\r\n", 1)
         lines = head.decode("iso-8859-1").split("\r\n")
         try:
@@ -1028,6 +1070,11 @@ class Batch:
 
     async def _request_once(self, path: str) -> Response:
         t = self._t
+        if self._conn is not None and self._conn.requests and await self._conn.unread():
+            # Something arrived that no request asked for: answering the next
+            # GET from that stream could hand it the wrong body. Reconnect.
+            _LOGGER.debug("%s: unread input on a kept-alive connection; reconnecting", t.host)
+            self._kill()
         if self._conn is None:
             if self._closed:
                 # The batch ended while this request was waiting (e.g. a task

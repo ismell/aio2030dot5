@@ -14,15 +14,17 @@ Changes since the last pre-release (0.3.3).
   `Meter`).
 - `MeterAuthError.reason` (and `PeerInfo.auth_reason`) is typed `AuthReason`, a closed `Literal`.
 - `snapshot.errors` may hold `TIME_ERROR_KEY` (`":time"`), which is not a channel key.
-- `ReadingGuard` rules (below): growth is bounded by when a value was first and last seen, rebases need observed time
-  as well as reads and are all recorded. `ReadingGuard.registers` holds `(value, first seen)`, with `.last_seen`
+- `ReadingGuard` rules (below): growth is bounded by when a value was first and last seen, and a new baseline needs
+  a day of observation as well as reads, in both directions (it was 3 reads in 1 h upward). The constructor takes
+  `max_power`, `confirm`, `confirm_seconds` and `max_refresh`. `ReadingGuard.registers` holds `(value, first seen)`, with `.last_seen`
   beside it; `ReadingGuard.pending` is a list of keys (the runs are internal). State saved by 0.3.x still loads.
 - Every `from_dict()` accepts any mapping and raises `ProfileError` for malformed data, where some raised
   `KeyError`/`TypeError`/`ValueError` before.
 - A body without framing that ends without close_notify is a `MeterProtocolError`.
-- `MeterHttpError(path, status, reason_phrase)` keeps the HTTP reason phrase as `.reason_phrase`
-  (`MeterAuthError.reason` is the `AuthReason`).
-- Bytes after a complete response close the connection instead of being read as the next response.
+- `MeterHttpError(path, status, reason_phrase)` keeps the HTTP reason phrase as `.reason_phrase`; the keyword
+  argument and attribute were `reason` (`MeterAuthError.reason` is the `AuthReason`).
+- Bytes after a complete response close the connection instead of being read as the next response, whether they
+  arrive with it or later (a stray blank line is tolerated). A kept-alive connection is checked before reuse.
 
 ### Reading guard
 
@@ -30,18 +32,20 @@ Changes since the last pre-release (0.3.3).
   questionable and reads that failed become None, summation channels and ToU tiers (tier 0, the total, included)
   go through `register()`, power through `power()`. It returns `AcceptedReadings(values, tou)`.
   `questionable(measurement)` exposes the meter's own verdict on a reading.
-- A register may grow by `max_power` times the time since its value was first seen, but for no more than
-  `max_refresh` (2 h) past its last read: a ToU tier the meter refreshes hourly may step by an hour's worth, a
-  spike after a quiet weekend is still a spike, and growth while the consumer was down is allowed.
-- A new series is adopted only once it has been observed long enough as well as repeated: `confirm` reads over
-  `confirm_seconds` (3 reads, 1 h) upward, `confirm_decrease` over `confirm_decrease_seconds` (12 reads, 24 h)
-  downward, with each gap between reads counting for at most `max_gap` (2 h). A meter answering 0 for a while is not
-  taken for a reset, however often it is polled; a slow or flaky poller still confirms a real one. A run survives a
-  restart (it is part of `to_dict()`) and tolerates one stray read per four consistent ones.
-- Every adoption is recorded in `.rebases` (downward ones also in `.resets`). After any rebase the replaced baseline is
-  kept for a day, and the guard returns to it at once if the meter does.
-- All times are the consumer's clock, never the meter's. `register(..., monotonic=False)` guards a net register.
-  `restore()` ignores malformed entries one by one.
+- A register may grow by `max_power` times its allowance: the time since its value was first seen, but no more than
+  `max_refresh` (90 min) past its latest accepted read. A ToU tier the meter refreshes hourly may step by what the
+  time since its last change allows, a spike after a quiet weekend is still a spike, and time the consumer was
+  down counts in full. A small decrease below an accepted value (one within the allowance) holds that value instead
+  of being rejected, so a consumer's total stays right.
+- A new baseline is adopted only after `confirm` consistent reads (12) over `confirm_seconds` (24 h) of observed
+  time, in either direction; the gap before each read counts for at most 2 h, so no outage or restart confirms
+  anything. A run survives a restart (it is part of `to_dict()`) and tolerates one stray read per four consistent
+  ones.
+- Every adoption is recorded in `.rebases` (downward ones also in `.resets`) and named in
+  `AcceptedReadings.rebased`. The replaced baseline is kept for a day, and the guard returns to it at once if the
+  meter does.
+- All times are the consumer's clock, never the meter's; if it steps back, a register is allowed `max_refresh`.
+  `register(..., monotonic=False)` guards a net register. `restore()` ignores malformed entries one by one.
 
 ### Meter
 
@@ -55,8 +59,8 @@ Changes since the last pre-release (0.3.3).
 - A replayed snapshot keeps `MeterNotFound` and `MeterHttpError` as such, and replaying is idempotent.
 - `KEY_SCHEME`, `PROFILE_VERSION`, `TIME_ERROR_KEY`, `Reading` and `short_lfdi` are exported from the package root.
   Exceptions can be copied and pickled with their state. Messages and logs, debug logs included, show only the last
-  six digits of an LFDI (`short_lfdi`) and of an SFDI in an mDNS name, which tells devices apart without revealing
-  them; attributes keep them whole. A cached profile's `poll_rate` is bounded like a discovered one.
+  six digits of an LFDI (`short_lfdi`) and the last three of an SFDI in an mDNS name, which tells devices apart
+  without revealing them; attributes keep them whole. A cached profile's `poll_rate` is bounded like a discovered one.
 
 ### Input a healthy meter never sends
 
