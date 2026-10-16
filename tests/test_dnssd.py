@@ -29,7 +29,7 @@ def test_instance_name_with_or_without_the_service_suffix(name: str) -> None:
 
 
 def test_txt_https_port_wins_over_srv_and_keys_are_case_insensitive() -> None:
-    adv = parse_advertisement(NAME, "fd00::5", 443, {"TxtVers": "1", "DCAP": "/sep2/dcap", "HTTPS": "8443"})
+    adv = parse_advertisement(NAME, "2001:db8::5", 443, {"TxtVers": "1", "DCAP": "/sep2/dcap", "HTTPS": "8443"})
     assert (adv.port, adv.dcap_path) == (8443, "/sep2/dcap")
     assert parse_advertisement(NAME, "h", 8081, {"txtvers": "1"}).dcap_path == "/dcap"
     assert parse_advertisement(NAME, "h", 8081, {"txtvers": "1"}).port == 8081

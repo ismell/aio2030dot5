@@ -14,9 +14,11 @@ derived from what a channel *is* -- quantity, statistic, direction, phase
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -24,6 +26,7 @@ from urllib.parse import urljoin, urlsplit
 from .exceptions import MeterProtocolError, ProfileError
 from .identity import sfdi_from_lfdi
 from .models import (
+    MAX_HREF,
     Accumulation,
     DataQualifier,
     DeviceCapability,
@@ -42,6 +45,8 @@ from .models import (
     children,
     local_name,
     parse_xml,
+    restores,
+    short,
 )
 from .transport import Batch
 
@@ -58,6 +63,8 @@ DEFAULT_POLL_RATE = 900  # IEEE 2030.5 default when a list omits pollRate
 
 
 class Quantity(enum.StrEnum):
+    """What a channel measures: power, energy, VA, var, voltage, current, ..."""
+
     POWER = "power"
     ENERGY = "energy"
     APPARENT_POWER = "apparent_power"
@@ -72,6 +79,8 @@ class Quantity(enum.StrEnum):
 
 
 class Statistic(enum.StrEnum):
+    """How a channel accumulates: instantaneous, summation, ToU summation, interval, cumulative, ..."""
+
     INSTANTANEOUS = "instantaneous"
     MAXIMUM = "maximum"
     MINIMUM = "minimum"
@@ -83,6 +92,8 @@ class Statistic(enum.StrEnum):
 
 
 class Direction(enum.StrEnum):
+    """Which way the energy flows: delivered (import), received (export), net, total, or none."""
+
     DELIVERED = "delivered"  # grid -> customer (import)
     RECEIVED = "received"  # customer -> grid (export)
     NET = "net"
@@ -204,6 +215,7 @@ class Channel:
     ambiguous: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         return {
             "key": self.key,
             "quantity": self.quantity.value,
@@ -221,9 +233,11 @@ class Channel:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Channel:
+    @restores
+    def from_dict(cls, d: Mapping[str, Any]) -> Channel:
         # The classification is restored as stored, never recomputed: a key
         # must keep meaning what it meant when it was assigned.
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         rt = ReadingType.from_dict(d["reading_type"])
         return cls(
             key=d["key"],
@@ -302,6 +316,7 @@ class MeterProfile:
         return next((c for c in self.channels if c.key == key), None)
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         return {
             "version": PROFILE_VERSION,
             "key_scheme": KEY_SCHEME,
@@ -323,10 +338,11 @@ class MeterProfile:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> MeterProfile:
+    @restores
+    def from_dict(cls, d: Mapping[str, Any]) -> MeterProfile:
         """Raises :class:`ProfileError` for another version or a malformed dict."""
-        if not isinstance(d, dict) or d.get("version") != PROFILE_VERSION or d.get("key_scheme") != KEY_SCHEME:
-            got = (d.get("version"), d.get("key_scheme")) if isinstance(d, dict) else d
+        if not isinstance(d, Mapping) or d.get("version") != PROFILE_VERSION or d.get("key_scheme") != KEY_SCHEME:
+            got = (d.get("version"), d.get("key_scheme")) if isinstance(d, Mapping) else d
             raise ProfileError(f"unsupported profile (version, key scheme) {got!r}")
         pin = d.get("certificate_lfdi")
         if pin is not None and (not isinstance(pin, str) or not re.fullmatch(r"[0-9A-F]{40}", pin)):
@@ -369,13 +385,15 @@ def resolve_href(base: str, href: str, host: str, port: int) -> str:
     """
     bare = host.strip("[]").split("%", 1)[0].lower()  # IPv6 literal without zone
     origin = f"https://[{bare}]:{port}" if ":" in bare else f"https://{bare}:{port}"
+    if len(href) > MAX_HREF:
+        raise MeterProtocolError(f"href from meter is {len(href)} characters long: {short(href)}")
     try:
         parts = urlsplit(urljoin(origin + base, href.strip()))
         link_port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError as err:  # bad port, unbalanced brackets, ...
-        raise MeterProtocolError(f"malformed link from meter: {href!r}") from err
+        raise MeterProtocolError(f"malformed link from meter: {short(href)}") from err
     if parts.scheme not in ("https", "http") or not parts.hostname or link_port != port:
-        raise MeterProtocolError(f"link to another server: {href!r}")
+        raise MeterProtocolError(f"link to another server: {short(href)}")
     return parts.path + (f"?{parts.query}" if parts.query else "")
 
 
@@ -384,9 +402,11 @@ def _paged(href: str, start: int, limit: int) -> str:
     return f"{href}{sep}s={start}&l={limit}"
 
 
-# An Itron agent's longest list is 60 ReadingSets, or 48 Readings in a set.
+# An Itron agent's longest list is 60 ReadingSets, or 48 Readings in a set,
+# and a whole Itron list is well under 100 KiB.
 MAX_LIST_ITEMS = 2000
 MAX_LIST_PAGES = 200
+MAX_LIST_BYTES = 8 * 1024 * 1024
 
 
 async def get_list(
@@ -397,35 +417,49 @@ async def get_list(
     Pages are followed by the count actually returned and the list's own
     ``all``: agents return short pages, and a Kitu-based agent's
     ``ReadingListLink@all`` is stale until the list is fetched once. A list
-    longer than ``MAX_LIST_ITEMS`` (or needing more than ``MAX_LIST_PAGES``
-    GETs) is refused: no meter holds that many, and following a device's
-    ``all`` blindly could keep the meter's only connection busy for hours.
+    longer than ``MAX_LIST_ITEMS``, or needing more than ``MAX_LIST_PAGES`` GETs
+    or ``MAX_LIST_BYTES`` of responses, is refused: no meter holds that much,
+    and following a device's ``all`` blindly could hold the meter's only
+    connection, and memory, for hours.
     """
     items: list[Any] = []
     page: ListPage | None = None
-    seen: set[str] = set()
-    pages = 0
+    seen: set[str | bytes] = set()
+    pages = received = 0
     while True:
         pages += 1
-        if pages > MAX_LIST_PAGES or len(items) > MAX_LIST_ITEMS:
-            raise MeterProtocolError(f"{href} is longer than any meter's list ({len(items)} items so far)")
+        if pages > MAX_LIST_PAGES:
+            raise MeterProtocolError(f"{short(href)} needs more pages than any meter's list")
         want = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(items))
-        root = parse_xml(await batch.get(_paged(href, start, want)))
+        body = await batch.get(_paged(href, start, want))
+        received += len(body)
+        if received > MAX_LIST_BYTES:
+            raise MeterProtocolError(f"{short(href)} is larger than any meter's list ({received} bytes)")
+        root = parse_xml(body)
         if not local_name(root.tag).endswith("List"):
-            raise MeterProtocolError(f"{href} is not a list (<{local_name(root.tag)}>)")
+            raise MeterProtocolError(f"{short(href)} is not a list (<{short(local_name(root.tag))}>)")
         page = ListPage.of(root)
-        got = [e for e in children(root, item) if _identity(e) not in seen]
-        seen.update(_identity(e) for e in got)
+        if page.all > MAX_LIST_ITEMS and limit is None:
+            raise MeterProtocolError(f"{short(href)} claims {page.all} items, more than any meter's list")
+        got = []
+        for e in children(root, item):
+            identity = _identity(e)
+            if identity not in seen:
+                seen.add(identity)
+                got.append(e)
         items.extend(got)
+        if len(items) > MAX_LIST_ITEMS:
+            raise MeterProtocolError(f"{short(href)} is longer than any meter's list ({len(items)} items so far)")
         start += len(got)
         if not got or start >= page.all or (limit is not None and len(items) >= limit):
             return page, items
 
 
-def _identity(elem: Any) -> str:
+def _identity(elem: Any) -> str | bytes:
     """What makes a list item the same item on another page: its href, or for
-    an item without one (interval Readings), its content."""
-    return elem.get("href") or ET.tostring(elem, encoding="unicode")
+    an item without one (interval Readings), a digest of its content."""
+    href = elem.get("href")
+    return href if href else hashlib.sha256(ET.tostring(elem)).digest()
 
 
 # -- keys -----------------------------------------------------------------------
@@ -510,13 +544,17 @@ class MeterInfo:
 
     @property
     def certificate_sfdi(self) -> str | None:
+        """The SFDI of the certificate the meter presented, if known."""
         return sfdi_from_lfdi(self.certificate_lfdi) if self.certificate_lfdi else None
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         return {f: getattr(self, f) for f in self.__dataclass_fields__}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> MeterInfo:
+    @restores
+    def from_dict(cls, d: Mapping[str, Any]) -> MeterInfo:
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         fields: dict[str, Any] = {f: d.get(f) for f in cls.__dataclass_fields__}
         fields["dcap_path"] = fields["dcap_path"] or "/dcap"
         return cls(**fields)

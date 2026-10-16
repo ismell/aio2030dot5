@@ -1,11 +1,11 @@
 """Find meters on the network by mDNS, with python-zeroconf (the ``zeroconf`` extra).
 
 A meter's address is not its identity -- DHCP can move it. Store the meter's
-SFDI (or LFDI) and find its current address when needed::
+SFDI (to find it) and LFDI (to pin it), and find its current address when needed::
 
-    adv = await async_locate(aiozc, "123456789014")
+    adv = await async_locate(aiozc, sfdi)
     if adv:
-        meter = Meter(adv.host, ctx, adv.port, expected_lfdi=lfdi)
+        meter = await Meter.create(adv.host, identity, adv.port, expected_lfdi=lfdi, dcap_path=adv.dcap_path)
 
 The SFDI in an advertisement is only a hint; ``expected_lfdi`` makes the
 connection prove it. Lookup by SFDI relies on the Itron convention of naming
@@ -32,7 +32,7 @@ from .identity import canonical_sfdi
 
 _LOGGER = logging.getLogger(__name__)
 
-RESOLVE_TIMEOUT = 3.0
+_RESOLVE_TIMEOUT = 3.0
 
 
 async def async_browse(aiozc: AsyncZeroconf, *, listen: float = 5.0) -> list[Advertisement]:
@@ -78,7 +78,7 @@ async def _browse(aiozc: AsyncZeroconf, listen: float, want: str | None) -> list
 
 async def _resolve(aiozc: AsyncZeroconf, name: str) -> Advertisement | None:
     info = AsyncServiceInfo(SERVICE_TYPE, name)
-    if not await info.async_request(aiozc.zeroconf, int(RESOLVE_TIMEOUT * 1000)):
+    if not await info.async_request(aiozc.zeroconf, int(_RESOLVE_TIMEOUT * 1000)):
         _LOGGER.debug("%s did not resolve", name)
         return None
     # Prefer IPv4: the meters seen so far have no routable IPv6 address.

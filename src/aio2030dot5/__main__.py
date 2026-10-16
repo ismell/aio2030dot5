@@ -1,8 +1,8 @@
 """Talk to an IEEE 2030.5 HAN meter from the command line.
 
 Every command that talks to a meter opens at most one connection per batch and
-prints transport counters at the end, so it is safe to run against a meter that
-only tolerates one client (stop the other client first).
+prints transport counters at the end. Meters serve one client at a time: stop
+any other client of the meter (e.g. Home Assistant) first.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import InvalidIdentity, Meter, MeterError, MeterProfile, ProfileError, Statistic, __version__
+from . import InvalidIdentity, Meter, MeterError, MeterNotFound, MeterProfile, ProfileError, Statistic, __version__
 from .identity import check_identity, format_lfdi, generate_identity
 
 
@@ -36,6 +36,7 @@ def _meter_args(p: argparse.ArgumentParser) -> None:
 def _write_private(path: Path, text: str) -> None:
     """Write ``text`` to a new or existing file readable by the owner only."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # an existing file keeps its old mode otherwise
     with os.fdopen(fd, "w") as f:
         f.write(text)
 
@@ -60,8 +61,12 @@ def _identity(args: argparse.Namespace) -> int:
         if existing:
             raise _UsageError(f"refusing to overwrite {', '.join(existing)}")
         ident = generate_identity()
-        _write_private(key, ident.key_pem)
-        cert.write_text(ident.cert_pem)
+        cert.write_text(ident.cert_pem)  # first: a failure here leaves no orphan key behind
+        try:
+            _write_private(key, ident.key_pem)
+        except OSError:
+            cert.unlink(missing_ok=True)
+            raise
     check = check_identity(cert.read_bytes(), key.read_bytes())
     print(
         f"LFDI       {check.lfdi}\n"
@@ -85,31 +90,46 @@ async def _run(args: argparse.Namespace) -> int:
         profile = await _profile(meter, args.profile, refresh=args.cmd == "discover")
         if args.cmd == "discover":
             print(json.dumps(profile.to_dict(), indent=1))
-        elif args.cmd == "read":
-            snap = await meter.read(profile, profile.channels, include_time=True)
-            for key, m in snap.values.items():
-                print(
-                    f"{key:40} {m.value!s:>14} {m.unit:5} {m.start:%Y-%m-%dT%H:%M:%SZ}"
-                    if m.start
-                    else f"{key:40} {m.value!s:>14} {m.unit}"
-                )
-            for key, tiers in snap.tou.items():
-                for tier, m in sorted(tiers.items()):
-                    print(f"{key + '[tier ' + str(tier) + ']':40} {m.value!s:>14} {m.unit}")
-            if snap.clock_skew is not None:
-                print(f"{'clock_skew':40} {snap.clock_skew.total_seconds():+14.1f} s")
-        elif args.cmd == "intervals":
-            ch = profile.channel(args.channel)
-            if ch is None or ch.statistic != Statistic.INTERVAL:
-                keys = [c.key for c in profile.channels if c.statistic == Statistic.INTERVAL]
-                raise _UsageError(f"unknown interval channel {args.channel!r}; choose from {keys}")
-            for v in await meter.read_latest_intervals(ch):
-                print(f"{v.start:%Y-%m-%dT%H:%M}Z  {v.value} {v.unit}")
+            return 0
+        try:
+            return await _use(meter, profile, args)
+        except (MeterNotFound, ProfileError) as err:
+            if not args.profile:
+                raise
+            # A path the cached profile names is gone, or it is another meter's.
+            print(f"{args.profile}: {err}; discovering again", file=sys.stderr)
+            meter = await Meter.from_files(args.host, args.cert, args.key, args.port)
+            return await _use(meter, await _profile(meter, args.profile, refresh=True), args)
     except MeterError as err:
         print(f"error: {type(err).__name__}: {err}", file=sys.stderr)
         return 1
     finally:
         print(f"transport: {meter.stats.to_dict()}", file=sys.stderr)
+
+
+async def _use(meter: Meter, profile: MeterProfile, args: argparse.Namespace) -> int:
+    """Run ``read`` or ``intervals`` with ``profile``."""
+    meter.adopt(profile)
+    if args.cmd == "read":
+        snap = await meter.read(profile, profile.channels, include_time=True)
+        for key, m in snap.values.items():
+            print(
+                f"{key:40} {m.value!s:>14} {m.unit:5} {m.start:%Y-%m-%dT%H:%M:%SZ}"
+                if m.start
+                else f"{key:40} {m.value!s:>14} {m.unit}"
+            )
+        for key, tiers in snap.tou.items():
+            for tier, m in sorted(tiers.items()):
+                print(f"{key + '[tier ' + str(tier) + ']':40} {m.value!s:>14} {m.unit}")
+        if snap.clock_skew is not None:
+            print(f"{'clock_skew':40} {snap.clock_skew.total_seconds():+14.1f} s")
+    elif args.cmd == "intervals":
+        ch = profile.channel(args.channel)
+        if ch is None or ch.statistic != Statistic.INTERVAL:
+            keys = [c.key for c in profile.channels if c.statistic == Statistic.INTERVAL]
+            raise _UsageError(f"unknown interval channel {args.channel!r}; choose from {keys}")
+        for v in await meter.read_latest_intervals(ch):
+            print(f"{v.start:%Y-%m-%dT%H:%M}Z  {v.value} {v.unit}")
     return 0
 
 

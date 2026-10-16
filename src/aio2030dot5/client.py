@@ -10,15 +10,24 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import re
 import ssl
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .exceptions import AuthReason, MeterAuthError, MeterError, MeterNotFound, MeterProtocolError, ProfileError
+from .exceptions import (
+    AuthReason,
+    MeterAuthError,
+    MeterError,
+    MeterHttpError,
+    MeterNotFound,
+    MeterProtocolError,
+    ProfileError,
+)
 from .identity import Identity
 from .models import (
     DeviceInformation,
@@ -35,6 +44,7 @@ from .models import (
     interval_values,
     local_name,
     parse_xml,
+    restores,
 )
 from .profile import Channel, MeterInfo, MeterProfile, Statistic, discover, get_list, read_meter_info, resolve_href
 from .transport import (
@@ -49,13 +59,13 @@ from .transport import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Keys in this library's to_dict() output (and in Identity.to_dict()) that
-# identify the meter, its owner's premises or a secret. For Home Assistant
-# diagnostics: async_redact_data(data, REDACT_KEYS).
 # The key under which read(partial=True) records a failed clock read in
 # MeterSnapshot.errors (no channel key contains a colon).
 TIME_ERROR_KEY = ":time"
 
+# Keys in this library's to_dict() output (and in Identity.to_dict()) that
+# identify the meter, its owner's premises or a secret. For Home Assistant
+# diagnostics: async_redact_data(data, REDACT_KEYS).
 REDACT_KEYS = frozenset(
     {
         "cert_pem",
@@ -105,7 +115,9 @@ class MeterSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> MeterSnapshot:
+    @restores
+    def from_dict(cls, d: Mapping[str, Any]) -> MeterSnapshot:
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         fetched_at = _from_iso(d["fetched_at"])
         if fetched_at is None:
             raise ValueError("fetched_at is required")
@@ -149,8 +161,11 @@ class Meter:
     checks the meter's certificate against ``expected_lfdi`` before sending a
     request, and raises :class:`MeterIdentityMismatch` if another device
     answers (e.g. after a DHCP change -- find the meter again by mDNS). If
-    ``expected_lfdi`` is not given, :meth:`discover` pins the meter it finds,
-    and :meth:`read` pins the one a cached profile was discovered from.
+    ``expected_lfdi`` is not given, :meth:`discover` pins the meter it finds;
+    :meth:`read`, :meth:`device_information` and :meth:`meter_time` pin the one
+    a cached profile was discovered from. The interval calls take a channel, not
+    a profile: call :meth:`adopt` with the cached profile first (or pass
+    ``expected_lfdi``) so they are checked too.
     """
 
     def __init__(
@@ -212,8 +227,8 @@ class Meter:
     async def from_files(
         cls,
         host: str,
-        cert_path: str,
-        key_path: str,
+        cert_path: str | os.PathLike[str],
+        key_path: str | os.PathLike[str],
         port: int = 8081,
         *,
         timeouts: Timeouts | None = None,
@@ -243,6 +258,7 @@ class Meter:
 
     @property
     def port(self) -> int:
+        """The port this Meter talks to."""
         return self._port
 
     @property
@@ -294,12 +310,18 @@ class Meter:
         """Walk the resource tree (~30 GETs, one connection), starting at
         ``dcap_path`` (default: the Meter's). Pins the meter
         (``expected_lfdi``) if nothing was pinned yet."""
-        async with self._transport.batch() as b:
-            peer = await b.connect()
-            if peer is not None and self._transport.expected_lfdi is None:
-                # Pin now, so a reconnect mid-walk cannot mix in another device.
-                self._transport.expected_lfdi = peer.lfdi
-            profile = await discover(b, self.host, self.port, dcap_path=dcap_path or self.dcap_path)
+        pinned_here = False
+        try:
+            async with self._transport.batch() as b:
+                peer = await b.connect()
+                if peer is not None and self._transport.expected_lfdi is None:
+                    # Pin now, so a reconnect mid-walk cannot mix in another device.
+                    self._transport.expected_lfdi, pinned_here = peer.lfdi, True
+                profile = await discover(b, self.host, self.port, dcap_path=dcap_path or self.dcap_path)
+        except BaseException:
+            if pinned_here:  # a walk that failed proves nothing: do not keep its pin
+                self._transport.expected_lfdi = None
+            raise
         if peer is None:
             return profile
         if profile.meter_lfdi and profile.meter_lfdi.upper() != peer.lfdi:
@@ -311,9 +333,10 @@ class Meter:
             )
         return dataclasses.replace(profile, certificate_lfdi=peer.lfdi)
 
-    def _pin(self, profile: MeterProfile) -> None:
-        """Adopt a cached profile's meter identity, or refuse a profile from
-        another meter."""
+    def adopt(self, profile: MeterProfile) -> None:
+        """Pin the meter a cached profile was discovered from, so every call --
+        the interval calls included -- checks it is talking to that meter.
+        ``ProfileError`` if this Meter already expects another one."""
         pinned = profile.certificate_lfdi.upper() if profile.certificate_lfdi else None
         if pinned is None:
             return
@@ -339,7 +362,8 @@ class Meter:
 
         ``include_time``: also read the meter's clock (``snapshot.meter_time``,
         ``snapshot.clock_skew``). It is read first, and ``fetched_at`` is the
-        moment it answered.
+        moment it answered. A profile without a TimeLink leaves ``meter_time``
+        None and records nothing.
 
         ``partial``: a channel the meter answers with an error or something
         unparsable (``MeterProtocolError``, incl. ``MeterNotFound``) is left
@@ -348,7 +372,7 @@ class Meter:
         Connection, timeout, busy and authentication errors still raise: they
         concern the meter, not a channel.
         """
-        self._pin(profile)
+        self.adopt(profile)
         values: dict[str, Measurement] = {}
         tou: dict[str, TouRegister] = {}
         errors: dict[str, MeterError] = {}
@@ -443,7 +467,7 @@ class Meter:
     async def device_information(self, profile: MeterProfile) -> DeviceInformation | None:
         """The meter's DeviceInformation (manufacturer, model, versions), or
         None if it links none."""
-        self._pin(profile)
+        self.adopt(profile)
         if not profile.device_information_href:
             return None
         async with self._transport.batch() as b:
@@ -451,7 +475,7 @@ class Meter:
 
     async def meter_time(self, profile: MeterProfile) -> MeterTime:
         """The meter's clock. Raises ``MeterProtocolError`` if it has none."""
-        self._pin(profile)
+        self.adopt(profile)
         if not profile.time_href:
             raise MeterProtocolError("meter advertises no TimeLink")
         async with self._transport.batch() as b:
@@ -500,11 +524,16 @@ async def _list_sets(b: Batch, channel: Channel, host: str, port: int) -> list[R
 def _replayed_error(text: str) -> MeterError:
     """An error recorded by :meth:`MeterSnapshot.to_dict`, as close to its
     original kind as the text allows (a replayed fixture keeps "rediscover")."""
-    name, _, message = text.partition(": ")
+    name, sep, message = text.partition(": ")
+    if not sep or not name.isidentifier():
+        name, message = "", text
+    http = re.fullmatch(r"GET (\S+) -> HTTP (\d{3}) ?(.*)", message)
+    if name in ("MeterNotFound", "MeterHttpError") and http:
+        kind = MeterNotFound if name == "MeterNotFound" else MeterHttpError
+        return kind(http[1], int(http[2]), http[3])
     if name == "MeterNotFound":
-        m = re.fullmatch(r"GET (\S+) -> HTTP (\d{3})\b.*", message)
-        return MeterNotFound(m[1], int(m[2])) if m else MeterNotFound(message, 404)
-    return MeterProtocolError(text)
+        return MeterNotFound(message, 404)
+    return MeterProtocolError(message)  # to_dict() puts the class name back: replay is idempotent
 
 
 def _resolve_set(base: str, rs: ReadingSetInfo, host: str, port: int) -> ReadingSetInfo:

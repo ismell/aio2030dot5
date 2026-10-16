@@ -25,7 +25,8 @@ This library is designed around that:
   - one handshake retry after `BAD_SIGNATURE`;
   - one reconnect when the meter drops a kept-alive connection before answering (GET is idempotent).
 
-  Exceptions say what happened, and the caller decides. Every one is a `MeterError`:
+  Exceptions say what happened, and the caller decides. Everything the meter (or a device at its address) causes
+  is a `MeterError`; mistakes in the calling code raise `ValueError` or `RuntimeError`.
 
   ```
   MeterError
@@ -39,14 +40,13 @@ This library is designed around that:
   └── InvalidIdentity             a certificate/key that cannot be used
   ```
 
-  Starting a batch from inside another one for the same meter raises `RuntimeError` (it would deadlock).
-
   Each request is bounded by `Timeouts` (by default connect 10 s, handshake 20 s, response 20 s, with one
   handshake retry and one reconnect), but one call makes several requests (`discover()` about 30). For a deadline
-  on the whole call, set `Timeouts(batch=…)`.
+  on the whole call, set `Timeouts(batch=…)`; time spent waiting for the meter's lock or for connection pacing does
+  not count against it.
 - **One meter, one lock.** Every `Meter` object for the same meter on an event loop shares a lock and connection pacing,
   keyed by resolved address and port. "meter.local" and its IP are one meter. Batches are not re-entrant: starting one from inside
-  another raises `RuntimeError` rather than deadlocking.
+  another for the same meter raises `RuntimeError` rather than deadlocking.
 - **Discovery by meaning, not by path.** Each MeterReading is classified from its ReadingType
   (quantity, statistic, direction, phase), with its description breaking ties older agents leave. Callers ask for
   "energy delivered" rather than `/upt/1/mr/3`.
@@ -57,10 +57,13 @@ This library is designed around that:
     another scheme raises `ProfileError`.
   - Two readings that classify identically are numbered `_2`, `_3` in mRID order and flagged `ambiguous`.
 
-- **Identified by certificate, not address.** In IEEE 2030.5 a device's LFDI is the SHA-256 of its certificate.
+- **Identified by certificate, not address.** In IEEE 2030.5 a device's LFDI is the leftmost 160 bits of the
+  SHA-256 of its certificate.
   - Every connection checks the meter's certificate against `expected_lfdi` before sending a request. Another device
     at the address raises `MeterIdentityMismatch`, e.g. after a DHCP change.
-  - `discover()` pins the meter it finds, and a cached profile carries the pin.
+  - `discover()` pins the meter it finds. A cached profile carries the pin: `read()` takes it, and
+    `meter.adopt(profile)` makes every call check it (the interval calls take a channel, not a profile). Simplest:
+    store the meter's LFDI and pass `expected_lfdi=`.
   - `probe_tls()` reads the meter's identity even before our certificate is registered: the meter sends its
     certificate in the clear before it refuses ours.
 - **Found by mDNS.** Meters advertise `_smartenergy._tcp` with their SFDI in the instance name.
@@ -100,15 +103,17 @@ from zeroconf.asyncio import AsyncZeroconf
 from aio2030dot5 import Meter, canonical_sfdi, load_identity
 from aio2030dot5.locate import async_locate
 
-identity = load_identity(cert_pem, key_pem)
+identity = load_identity(cert_pem, key_pem)  # your certificate and key, as PEM text
+sfdi = "123456789014"  # the meter's SFDI, as printed on it or shown by the utility's portal
 async with AsyncZeroconf() as aiozc:  # or your application's shared instance
-    adv = await async_locate(aiozc, "123456789014")  # the meter's SFDI, as printed on it or its portal
+    adv = await async_locate(aiozc, sfdi)
 if adv is None:
     raise SystemExit("meter not heard on the network")
 
-# First contact: check that the device is the one advertised, then pin its LFDI.
+# First contact: check that the device has the SFDI you expect, then pin its LFDI.
 peer = await (await Meter.create(adv.host, identity, adv.port)).probe_tls()
-assert canonical_sfdi(peer.sfdi) == adv.sfdi
+if canonical_sfdi(peer.sfdi) != canonical_sfdi(sfdi):
+    raise SystemExit("another device answered")
 meter = await Meter.create(adv.host, identity, adv.port, expected_lfdi=peer.lfdi, dcap_path=adv.dcap_path)
 profile = await meter.discover()  # every connection now proves it is that meter
 ```
@@ -128,21 +133,36 @@ Everything a config flow and coordinator need, without files:
 from aio2030dot5 import Identity, Meter, MeterAuthError, generate_identity, load_identity, REDACT_KEYS
 
 identity = await hass.async_add_executor_job(generate_identity)  # or load_identity(cert, key) from a form
-entry_data = {"identity": identity.to_dict(), "sfdi": adv.sfdi}  # secret: redact with REDACT_KEYS
+probe = await Meter.create(adv.host, identity, adv.port)
+peer = await probe.probe_tls()  # who is there, even before our certificate is registered
+entry_data = {  # the identity is secret: redact with REDACT_KEYS
+    "identity": identity.to_dict(),
+    "meter_lfdi": peer.lfdi,  # pin it: every later connection must present this certificate
+}
 
-meter = await Meter.create(adv.host, Identity.from_dict(entry_data["identity"]), adv.port, dcap_path=adv.dcap_path)
-peer = await meter.probe_tls()  # who is there, even before registration
+meter = await Meter.create(
+    adv.host,
+    Identity.from_dict(entry_data["identity"]),
+    adv.port,
+    expected_lfdi=entry_data["meter_lfdi"],
+    dcap_path=adv.dcap_path,
+)
 if peer.client_accepted:
     info = await meter.probe()  # 1-3 GETs: lFDI/sFDI, manufacturer, model, serial, versions
 ```
 
-- **`Timeouts(batch=…)`** is a per-call deadline. It starts once the meter's lock is held, so time spent queued behind
-  another reader never counts against it.
+- **`Timeouts(batch=…)`** is a per-call deadline. It starts once the meter's lock is held, and connection pacing does
+  not count against it either.
+- **`read(profile, channels, include_time=True, partial=True)`** suits a coordinator: a channel that fails is
+  recorded in `snapshot.errors` (a failed clock read under `TIME_ERROR_KEY`) instead of failing the whole poll; a
+  `MeterNotFound` there means the profile is stale.
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
-  faster than the service allows (a net register may fall, at that rate). It adopts a new series only once it has
-  lasted (an hour upward, a day downward), records every adoption in `.rebases` and downward ones in `.resets`, so a
-  consumer can start a new accumulation cycle instead of booking the step.
+  faster than the service allows, judged at the time the meter took each reading. A net register may move either
+  way at that rate. It adopts a new series only once it has lasted: an hour and 3 reads upward, a day and 12 reads
+  downward (a net register always uses the upward rule). `.rebases` holds the time of each register's latest
+  adoption and `.resets` that of its latest downward one, so a consumer can start a new accumulation cycle instead of
+  booking the step.
   `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with the meter's own "questionable"
   flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.to_dict()` and restore it with
   `ReadingGuard.from_dict(data)`.
@@ -150,12 +170,14 @@ if peer.client_accepted:
 - **`MeterProfile`** also keeps what the meter says it is (`model`, `serial_number`, `hardware_version`), None where the
   meter leaves them empty, as Itron does.
 - **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, profiles, `MeterInfo`, `Identity` and
-  `ReadingGuard`, for caches, test fixtures and diagnostics.
+  `ReadingGuard`, for caches, test fixtures and diagnostics. `from_dict()` accepts any mapping and raises
+  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`); `ReadingGuard.from_dict()` ignores what it
+  cannot use and starts fresh.
 
 ## Client identity
 
 The meter admits a client whose self-signed certificate's **LFDI** has been registered with the utility.
-`aio2030dot5.identity` can:
+The identity functions (`generate_identity`, `load_identity`, `check_identity`, `format_lfdi`, ...) can:
 - generate a certificate in the profile an Itron meter accepts;
 - compute the LFDI and SFDI;
 - validate a certificate/key pair;

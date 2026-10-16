@@ -121,6 +121,38 @@ def test_a_drop_lasting_a_day_is_a_reset_and_the_old_series_can_return() -> None
     assert guard.rebases["r"] == t and "r" not in guard.displaced
 
 
+def test_a_stuck_high_value_adopted_after_an_hour_gives_way_to_the_real_register() -> None:
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    results = _series(guard, [9e9] * 62, NOW, 60.0)  # stuck for an hour: adopted
+    assert results[-1] == 9e9 and guard.rebases["r"] <= NOW + 62 * 60
+    back = guard.register("r", LIFETIME + 50, NOW + 63 * 60)
+    assert back == LIFETIME + 50  # at once, not after a day
+    assert guard.resets == {}  # a return, never a reset
+
+
+def test_a_confirmation_survives_restarts() -> None:
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    t = NOW
+    for _hour in range(25):  # a consumer restarting every hour while the meter reads ~0
+        t += HOUR
+        assert guard.register("r", t - NOW, t) is None or t - NOW >= DAY
+        guard = ReadingGuard.from_dict(guard.to_dict())
+    t += HOUR
+    assert guard.register("r", t - NOW, t) == t - NOW  # adopted: the run kept its start
+    assert "r" in guard.resets
+
+
+def test_a_lone_spike_does_not_restart_a_long_confirmation() -> None:
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    values = [float(i) for i in range(30)]
+    values[20] = 9e12  # one absurd read, 20 hours in
+    results = _series(guard, values, NOW, HOUR)
+    assert results[25] is not None  # adopted after 24 h despite the spike
+
+
 def test_an_inconsistent_run_starts_over() -> None:
     guard = ReadingGuard()
     guard.register("r", 1_000.0, 0.0)
@@ -289,9 +321,25 @@ async def test_a_failed_tou_register_is_unknown_in_tou_not_values(pki: Pki, fake
     assert accepted.tou[key] == dict.fromkeys((0, *channel.tou_tiers))
 
 
-async def test_now_defaults_to_the_clock(pki: Pki, fake_meter: FakeMeter) -> None:
+async def test_registers_are_judged_when_the_meter_took_them(pki: Pki, fake_meter: FakeMeter) -> None:
     profile, snapshot = await _snapshot(pki, fake_meter)
+    energy = _key(profile, statistic=Statistic.SUMMATION)
+    taken = snapshot.values[energy].start
+    assert taken is not None
     guard = ReadingGuard()
     guard.accept(snapshot, profile)
-    energy = _key(profile, statistic=Statistic.SUMMATION)
+    assert guard.registers[energy][1] == taken.timestamp()
+    undated = _with_value(snapshot, energy, start=None)
+    guard.accept(undated, profile)  # no start: the clock
     assert abs(guard.registers[energy][1] - time.time()) < 60
+
+
+def test_a_register_refreshed_hourly_is_not_a_spike() -> None:
+    """ToU tiers on an Itron change about once an hour: polled every minute, the
+    step after an hour of EV charging must still be plausible."""
+    guard = ReadingGuard()
+    stamped = NOW
+    guard.register("tier", 1_000_000.0, stamped)
+    for _minute in range(1, 60):  # the same stale reading, stamped by the meter at NOW
+        assert guard.register("tier", 1_000_000.0, stamped) == 1_000_000.0
+    assert guard.register("tier", 1_007_500.0, NOW + 67 * 60) == 1_007_500.0  # 7.5 kWh in 67 min

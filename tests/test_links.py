@@ -65,8 +65,8 @@ def test_quality_flags() -> None:
 
 
 def test_ipv6_meter_links() -> None:
-    assert resolve_href("/", "/dcap", "fd00::5", 8081) == "/dcap"
-    assert resolve_href("/dcap", "https://[fd00::5]:8081/upt", "[fd00::5]", 8081) == "/upt"
+    assert resolve_href("/", "/dcap", "2001:db8::5", 8081) == "/dcap"
+    assert resolve_href("/dcap", "https://[2001:db8::5]:8081/upt", "[2001:db8::5]", 8081) == "/upt"
 
 
 @pytest.mark.parametrize("href", ["https://192.0.2.19:99999/x", "https://192.0.2.19:abc/x", "http://[::1/x"])

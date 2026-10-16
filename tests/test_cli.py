@@ -78,3 +78,29 @@ async def test_discover_always_walks_and_read_uses_the_cache(
     profile.write_text("{not json")
     assert await loop.run_in_executor(None, _run, ["read", *common]) == 0  # rediscovers
     assert json.loads(profile.read_text())["version"]
+
+
+async def test_a_cache_naming_a_vanished_path_is_rediscovered(
+    pki: Pki, fake_meter: FakeMeter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = Meter.from_files
+
+    async def fast(*args: Any, **kwargs: Any) -> Meter:
+        return await real(*args, **kwargs, min_connect_interval=0.0, request_spacing=0.0)
+
+    monkeypatch.setattr(Meter, "from_files", fast)
+    profile = tmp_path / "profile.json"
+    profile.write_text("{}")
+    profile.chmod(0o644)  # an existing, world-readable cache
+    common = ["--host", "127.0.0.1", "--port", str(fake_meter.port)]
+    common += ["--cert", str(pki.client_cert), "--key", str(pki.client_key), "--profile", str(profile)]
+    loop = asyncio.get_running_loop()
+    assert await loop.run_in_executor(None, _run, ["discover", *common]) == 0
+    assert stat.S_IMODE(profile.stat().st_mode) == 0o600  # tightened, not just kept
+    cached = json.loads(profile.read_text())
+    for ch in cached["channels"]:
+        if ch.get("reading_href"):
+            ch["reading_href"] = ch["reading_href"] + "/gone"  # the meter moved its resources
+    profile.write_text(json.dumps(cached))
+    assert await loop.run_in_executor(None, _run, ["read", *common]) == 0
+    assert "/gone" not in profile.read_text()

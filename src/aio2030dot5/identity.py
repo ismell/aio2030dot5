@@ -1,10 +1,10 @@
 """Client identity for IEEE 2030.5 HAN access: certificates, LFDI and SFDI.
 
 A HAN meter admits a client whose self-signed certificate's LFDI has been
-registered with the utility (for Xcel Energy, under Meters and devices in
-My Account). The profile generated here mirrors a certificate an Itron Gen5 Riva meter is
-known to accept: P-256 / ECDSA-SHA256, CN=MeterReaderHanClient, critical
-basicConstraints CA:TRUE, critical keyUsage digitalSignature, and the
+registered with the utility (for Xcel Energy, under Meters and devices in My
+Account). The profile generated here mirrors a certificate an Itron Gen5 Riva
+meter is known to accept: P-256 / ECDSA-SHA256, CN=MeterReaderHanClient,
+critical basicConstraints CA:TRUE, critical keyUsage digitalSignature, and the
 critical IEEE 2030.5 self-signed-client policy OID.
 
 Identities are plain PEM text, so they can live in a config entry:
@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import re
 import ssl
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -102,12 +103,12 @@ class Identity:
         return {"cert_pem": self.cert_pem, "key_pem": self.key_pem}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Identity:
+    def from_dict(cls, data: Mapping[str, Any]) -> Identity:
         """Reload a stored identity. Tolerates expiry and profile problems
         (they are in ``problems``); raises :class:`InvalidIdentity` only if it
         cannot be used at all."""
-        cert = data.get("cert_pem") if isinstance(data, dict) else None
-        key = data.get("key_pem") if isinstance(data, dict) else None
+        cert = data.get("cert_pem") if isinstance(data, Mapping) else None
+        key = data.get("key_pem") if isinstance(data, Mapping) else None
         if not isinstance(cert, str) or not isinstance(key, str):
             raise InvalidIdentity("not a stored identity", ("cert_pem and key_pem must be PEM text",))
         return load_identity(cert, key, strict=False)
@@ -115,6 +116,8 @@ class Identity:
 
 @dataclass(frozen=True, slots=True)
 class IdentityCheck:
+    """The result of :func:`check_identity`: the identity, and any problems with it."""
+
     lfdi: str
     sfdi: str
     not_after: datetime
@@ -122,6 +125,7 @@ class IdentityCheck:
 
     @property
     def ok(self) -> bool:
+        """True if nothing would stop a meter from accepting the identity."""
         return not self.problems
 
     def days_remaining(self, now: datetime | None = None) -> int:

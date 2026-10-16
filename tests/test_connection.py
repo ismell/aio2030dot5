@@ -21,9 +21,9 @@ from aio2030dot5 import (
 )
 
 from .conftest import Pki, make_meter
+from .helpers import SlowTree
 from .meter_server import FakeMeter
 from .scripted_server import Server, read_request, rst, server_ctx
-from .test_robustness import SlowTree
 
 # -- one connection across Meter objects -------------------------------------------------
 

@@ -19,12 +19,14 @@ from aio2030dot5 import (
     Meter,
     MeterConnectionError,
     MeterError,
+    MeterHttpError,
     MeterIdentityMismatch,
     MeterInfo,
     MeterNotFound,
     MeterProfile,
     MeterProtocolError,
     MeterSnapshot,
+    MeterTime,
     ProfileError,
     QualityFlags,
     Statistic,
@@ -181,8 +183,14 @@ def test_measurement_and_interval_dicts_round_trip() -> None:
     assert Measurement.from_dict(json.loads(json.dumps(m.to_dict()))) == m
     v = iv(15, 3.0, QualityFlags.ESTIMATED_LINEAR)
     assert IntervalValue.from_dict(json.loads(json.dumps(v.to_dict()))) == v
-    with pytest.raises(ValueError):
+    with pytest.raises(ProfileError):  # every from_dict fails the same way
         Measurement.from_dict({"value": 1, "unit": "W", "start": "2026-10-06T00:00:00"})  # naive
+    for broken in ([], None, {"value": 1}):
+        with pytest.raises(ProfileError):
+            Measurement.from_dict(broken)  # type: ignore[arg-type]
+    for cls in (MeterSnapshot, IntervalValue, TouRegister, MeterTime):
+        with pytest.raises(ProfileError):
+            cls.from_dict({"nonsense": object()})  # type: ignore[attr-defined]
 
 
 # -- diagnostics -------------------------------------------------------------------------
@@ -271,3 +279,40 @@ async def test_the_profile_keeps_what_the_meter_says_it_is(pki: Pki) -> None:
 async def test_an_empty_device_information_is_none(pki: Pki, fake_meter: FakeMeter) -> None:
     profile = await make_meter(pki, fake_meter.port).discover()
     assert (profile.model, profile.serial_number, profile.hardware_version) == (None, None, None)
+
+
+# -- pinning from a cached profile, and failed walks ---------------------------------
+
+
+async def test_adopting_a_cached_profile_pins_every_call(pki: Pki, fake_meter: FakeMeter) -> None:
+    profile = await make_meter(pki, fake_meter.port).discover()
+    fresh = make_meter(pki, fake_meter.port)  # e.g. after a restart: no expected_lfdi
+    assert fresh.expected_lfdi is None
+    fresh.adopt(profile)
+    assert fresh.expected_lfdi == profile.certificate_lfdi
+    channel = profile.channel("energy_interval_delivered")
+    assert channel is not None and await fresh.read_latest_intervals(channel)
+
+
+async def test_a_failed_walk_leaves_no_pin(pki: Pki) -> None:
+    tree = BrokenClock("/dcap", 404)
+    with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=tree) as fm:
+        meter = make_meter(pki, fm.port)
+        with pytest.raises(MeterNotFound):
+            await meter.discover()
+        assert meter.expected_lfdi is None
+
+
+def test_replaying_a_snapshot_twice_changes_nothing() -> None:
+    snapshot = MeterSnapshot(
+        fetched_at=datetime(2026, 1, 1, tzinfo=UTC),
+        errors={
+            "gone": MeterNotFound("/upt/1/mr/3/r", 410),
+            "odd": MeterProtocolError("bad value"),
+            "http": MeterHttpError("/upt/1/mr/4/r", 500, "Server Error"),
+        },
+    )
+    once = MeterSnapshot.from_dict(snapshot.to_dict())
+    twice = MeterSnapshot.from_dict(once.to_dict())
+    assert once.to_dict() == twice.to_dict() == snapshot.to_dict()
+    assert type(twice.errors["http"]) is MeterHttpError and twice.errors["http"].status == 500

@@ -4,6 +4,8 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -11,6 +13,11 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # A library: update the lock (what CI tests), never raise the minimum
+    # versions users get (cryptography>=43 must stay compatible with hosts).
+    versioning-strategy: lockfile-only
+    cooldown:
+      default-days: 7
     groups:
       python:
         patterns: ["*"]

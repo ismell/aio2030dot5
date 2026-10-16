@@ -24,33 +24,49 @@ only once it has lasted: ``confirm`` reads over at least ``confirm_seconds``
 answers 0 for a while (an agent restarting before its metrology is up) from
 being taken for a reset however often it is polled.
 
+A run survives a restart (it is part of :meth:`ReadingGuard.to_dict`) and the
+odd stray reading (one per four consistent reads), but reads alternating
+between two series never form one.
+
 Every adoption is recorded in :attr:`ReadingGuard.rebases`, and a downward one
 also in :attr:`ReadingGuard.resets`: a consumer keeping a running total should
-start a new accumulation cycle at either rather than book the step. After a
-downward rebase the earlier baseline is kept for ``confirm_decrease_seconds``;
-if the meter comes back to it, the guard returns to it (another rebase).
+start a new accumulation cycle at either rather than book the step. After any
+rebase the baseline it replaced is kept for ``confirm_decrease_seconds``; if the
+meter comes back to it -- the "new series" was a long-lived glitch after all --
+the guard returns to it at once (another rebase, never a reset).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from .models import QualityFlags
-from .profile import Direction, Quantity, Statistic
-
-if TYPE_CHECKING:
-    from .client import MeterSnapshot
-    from .models import Measurement
-    from .profile import MeterProfile
+from .client import MeterSnapshot
+from .models import Measurement, QualityFlags
+from .profile import Direction, MeterProfile, Quantity, Statistic
 
 __all__ = ["AcceptedReadings", "ReadingGuard", "questionable"]
 
 _LOGGER = logging.getLogger(__name__)
 _SLACK_WH = 1000.0
+
+
+@dataclass(slots=True)
+class _Run:
+    """Consistent rejected reads that may be a new baseline."""
+
+    first_time: float
+    last: tuple[float, float]  # (value, epoch seconds) of the latest read
+    count: int = 1
+    strays: int = 0  # inconsistent reads tolerated inside the run
+
+    def extend(self, cur: tuple[float, float]) -> None:
+        self.last = cur
+        self.count += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,10 +112,11 @@ class ReadingGuard:
         # key -> epoch seconds of the last rebase of any kind / of a downward one
         self.rebases: dict[str, float] = {}
         self.resets: dict[str, float] = {}
-        # key -> (value, epoch seconds) of the baseline a downward rebase replaced;
+        # key -> (value, epoch seconds) of the baseline the last rebase replaced;
         # kept for confirm_decrease_seconds after that rebase
         self.displaced: dict[str, tuple[float, float]] = {}
-        self.pending: dict[str, list[tuple[float, float]]] = {}
+        # key -> the run of consistent rejected reads that may become the baseline
+        self.pending: dict[str, _Run] = {}
         self.rejected = 0
         self._rejecting: set[str] = set()  # keys in a run of rejections (logged once)
 
@@ -111,6 +128,11 @@ class ReadingGuard:
         channels through :meth:`power`; other channels pass as read. A reading
         the meter flags questionable is None and never reaches the guard.
         Channels not in ``profile`` are skipped.
+
+        A register is judged at the time the meter took the reading (its
+        ``start``) when it says, else ``now``: a register the meter refreshes
+        only now and then (ToU tiers, about hourly on an Itron) then grows by
+        what the elapsed time allows, however often it is polled.
         """
         now = time.time() if now is None else now
         values: dict[str, float | None] = {}
@@ -131,7 +153,9 @@ class ReadingGuard:
             if value is None or questionable(measurement):
                 value = None
             elif channel.statistic == Statistic.SUMMATION:
-                value = self.register(key, value, now, monotonic=channel.direction != Direction.NET)
+                value = self.register(
+                    key, value, _taken(measurement, now), monotonic=channel.direction != Direction.NET
+                )
             elif channel.quantity == Quantity.POWER:
                 value = self.power(key, value)
             values[key] = value
@@ -143,7 +167,7 @@ class ReadingGuard:
             tou[key] = {
                 tier: None
                 if m.value is None or questionable(m)
-                else self.register(f"{key}_tier_{tier}", m.value, now, monotonic=monotonic)
+                else self.register(f"{key}_tier_{tier}", m.value, _taken(m, now), monotonic=monotonic)
                 for tier, m in register.items()
             }
         return AcceptedReadings(values, tou)
@@ -164,45 +188,62 @@ class ReadingGuard:
         if value is None:
             return None
         cur = (value, now)
+        displaced = self.displaced.get(key)
+        if displaced is not None and now - self.rebases.get(key, displaced[1]) > self.confirm_decrease_seconds:
+            del self.displaced[key]  # expired: the new series stands
+            displaced = None
         last = self.registers.get(key)
         if last is None or self._plausible(last, cur, monotonic):
             self._adopt(key, cur)
             return value
-        displaced = self.displaced.get(key)
         if displaced is not None:
-            if now - self.resets.get(key, displaced[1]) > self.confirm_decrease_seconds:
-                del self.displaced[key]
-            elif self._plausible(displaced, cur, monotonic):
+            if self._plausible(displaced, cur, monotonic):
                 _LOGGER.warning("%s: back to the earlier series at %s (was %s)", key, value, last[0])
                 del self.displaced[key]
                 self.rebases[key] = now
                 self._adopt(key, cur)
                 return value
-        run = self.pending.setdefault(key, [])
-        if run and not self._plausible(run[-1], cur, monotonic):
-            run.clear()  # not a consistent new series: start over from this read
-        run.append(cur)
+        run = self._track(key, cur, monotonic)
+        if run is None:  # a stray inside an established run: rejected, the run kept
+            self._reject(key, value, f"after {last[0]:.0f}")
+            return None
         down = monotonic and value < last[0]
         needed, span = (
             (self.confirm_decrease, self.confirm_decrease_seconds) if down else (self.confirm, self.confirm_seconds)
         )
-        if len(run) >= needed and now - run[0][1] >= span:
+        if run.count >= needed and now - run.first_time >= span:
             _LOGGER.warning(
                 "%s: rebasing from %s to %s after %d consistent reads over %.0f s (meter replaced or reset?)",
                 key,
                 last[0],
                 value,
-                len(run),
-                now - run[0][1],
+                run.count,
+                now - run.first_time,
             )
             self.rebases[key] = now
             if down:
                 self.resets[key] = now
-                self.displaced[key] = last
+            self.displaced[key] = last
             self._adopt(key, cur)
             return value
         self._reject(key, value, f"after {last[0]:.0f}")
         return None
+
+    def _track(self, key: str, cur: tuple[float, float], monotonic: bool) -> _Run | None:
+        """Add a rejected read to the run it is consistent with. A read that is
+        not is a stray: an established run tolerates one stray per four
+        consistent reads (a lone spike does not cost a day's confirmation),
+        but no more -- reads alternating between two series never form a run.
+        The run ``cur`` belongs to, or None if ``cur`` is a tolerated stray."""
+        run = self.pending.get(key)
+        if run is not None and self._plausible(run.last, cur, monotonic):
+            run.extend(cur)
+            return run
+        if run is not None and (run.strays + 1) * 4 <= run.count:
+            run.strays += 1
+            return None
+        run = self.pending[key] = _Run(cur[1], cur)
+        return run
 
     def _adopt(self, key: str, cur: tuple[float, float]) -> None:
         self.pending.pop(key, None)
@@ -230,12 +271,13 @@ class ReadingGuard:
             _LOGGER.info("%s: plausible again", key)
 
     def to_dict(self) -> dict[str, Any]:
-        """The state to persist (JSON-safe). Runs of pending reads are not kept."""
+        """The state to persist (JSON-safe), including runs still being confirmed."""
         return {
             "registers": {key: list(reading) for key, reading in self.registers.items()},
             "rebases": dict(self.rebases),
             "resets": dict(self.resets),
             "displaced": {key: list(reading) for key, reading in self.displaced.items()},
+            "pending": {key: [r.first_time, *r.last, r.count, r.strays] for key, r in self.pending.items()},
         }
 
     @classmethod
@@ -255,15 +297,41 @@ class ReadingGuard:
             target = getattr(self, name)
             for key, reading in readings.items() if isinstance(readings, Mapping) else ():
                 try:
-                    value, when = reading
-                    target[str(key)] = (float(value), float(when))
+                    value, when = _finite(reading[0]), _finite(reading[1])
+                    if len(reading) != 2:
+                        continue
+                    target[str(key)] = (value, when)
                 except (TypeError, ValueError):
                     continue
+        runs = data.get("pending")
+        for key, run in runs.items() if isinstance(runs, Mapping) else ():
+            try:
+                first, value, when, count, strays = run
+                self.pending[str(key)] = _Run(
+                    _finite(first), (_finite(value), _finite(when)), max(int(count), 1), max(int(strays), 0)
+                )
+            except (TypeError, ValueError):
+                continue
         for name in ("rebases", "resets"):
             times = data.get(name)
             target = getattr(self, name)
             for key, when in times.items() if isinstance(times, Mapping) else ():
                 try:
-                    target[str(key)] = float(when)
+                    target[str(key)] = _finite(when)
                 except (TypeError, ValueError):
                     continue
+
+
+def _taken(measurement: Measurement, now: float) -> float:
+    """When the meter took a reading (epoch seconds), else ``now``."""
+    return measurement.start.timestamp() if measurement.start is not None else now
+
+
+def _finite(value: Any) -> float:
+    """A stored number; ValueError for anything else, incl. bools, NaN and infinities."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise ValueError(f"not a number: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"not finite: {value!r}")
+    return number

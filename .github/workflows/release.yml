@@ -16,7 +16,20 @@ env:
   UV_VERSION: "0.11.19"
 
 jobs:
+  ref:
+    # Cheap and first: refuse a dry run from anything but main before running CI.
+    # (A branch could edit this file; the testpypi environment is restricted to
+    # main in the repository settings, which a branch cannot change.)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dry runs are from main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "dry runs are from main, not $GITHUB_REF_NAME"
+          exit 1
+
   ci:
+    needs: ref
     uses: ./.github/workflows/ci.yml
 
   build:
@@ -38,9 +51,10 @@ jobs:
       - name: A dry run gets its own dev version
         if: github.event_name == 'workflow_dispatch'
         run: |
-          test "$GITHUB_REF_NAME" = main || { echo "dry runs are from main, not $GITHUB_REF_NAME"; exit 1; }
-          sed -i -E "s/^__version__ = \"([^\"]+)\"/__version__ = \"\1.dev${GITHUB_RUN_NUMBER}\"/" src/aio2030dot5/__init__.py
-          grep -n '^__version__' src/aio2030dot5/__init__.py
+          # Run number and attempt: a re-run after a partial upload gets a new version too.
+          dev="dev${GITHUB_RUN_NUMBER}${GITHUB_RUN_ATTEMPT}"
+          sed -i -E "s/^__version__ = \"([^\"]+)\"/__version__ = \"\1.${dev}\"/" src/aio2030dot5/__init__.py
+          grep -q "^__version__ = \".*\.${dev}\"$" src/aio2030dot5/__init__.py || { echo "version not stamped"; exit 1; }
       - run: uv build
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

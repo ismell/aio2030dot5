@@ -10,15 +10,16 @@ become ``None`` rather than errors, because real agents omit fields freely
 from __future__ import annotations
 
 import enum
+import functools
 import itertools
 import re
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .exceptions import MeterProtocolError, ProfileError
+from .exceptions import MeterError, MeterProtocolError, ProfileError
 
 
 class Uom(enum.IntEnum):
@@ -116,6 +117,7 @@ UNIT_SYMBOLS: dict[Uom, str] = {
 _DOCTYPE = ("<!DOCTYPE", "<!ENTITY")
 _DOCTYPE_BYTES = tuple(m.encode(enc) for m in _DOCTYPE for enc in ("ascii", "utf-16-le", "utf-16-be"))
 MAX_TEXT = 1024  # no 2030.5 text element is longer than a few dozen characters
+MAX_ELEMENTS = 100_000  # a full page of 255 Readings is a few thousand
 
 
 def parse_xml(body: bytes | str) -> ET.Element:
@@ -124,10 +126,34 @@ def parse_xml(body: bytes | str) -> ET.Element:
     a capped response by orders of magnitude."""
     if any(m in body for m in (_DOCTYPE if isinstance(body, str) else _DOCTYPE_BYTES)):  # type: ignore[operator]
         raise MeterProtocolError("XML from meter has a document type declaration")
+    if body.count("<" if isinstance(body, str) else b"<") > MAX_ELEMENTS:  # type: ignore[arg-type]
+        raise MeterProtocolError("XML from meter has more elements than any 2030.5 resource")
     try:
         return ET.fromstring(body)
-    except ET.ParseError as err:
-        raise MeterProtocolError(f"malformed XML from meter: {err}") from err
+    except (ET.ParseError, ValueError, LookupError) as err:
+        # ValueError: a multi-byte encoding expat cannot read; LookupError: an unknown one.
+        raise MeterProtocolError(f"malformed XML from meter: {short(str(err), 160)}") from err
+
+
+def restores[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """For a ``from_dict`` classmethod: refuse anything but a mapping, and turn
+    whatever malformed data raises into ``ProfileError`` -- the one way every
+    ``from_dict`` in this library fails (``Identity`` raises ``InvalidIdentity``)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        data = args[1] if len(args) > 1 else next(iter(kwargs.values()), None)
+        owner = getattr(args[0], "__name__", "data") if args else "data"
+        if not isinstance(data, Mapping):
+            raise ProfileError(f"cannot restore {owner} from {type(data).__name__}")
+        try:
+            return fn(*args, **kwargs)
+        except MeterError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as err:
+            raise ProfileError(f"cannot restore {owner}: {type(err).__name__}: {short(str(err), 120)}") from err
+
+    return wrapper
 
 
 def short(value: object, limit: int = 64) -> str:
@@ -160,8 +186,18 @@ def text(elem: ET.Element, name: str) -> str | None:
     return t or None
 
 
+def _number_text(elem: ET.Element, name: str) -> str | None:
+    """A numeric child's text, unclamped: a number too long for any 2030.5
+    type is an error, never silently truncated."""
+    c = child(elem, name)
+    t = c.text.strip() if c is not None and c.text is not None else ""
+    if len(t) > 40:
+        raise MeterProtocolError(f"<{name}> is {len(t)} characters long: {short(t)}")
+    return t or None
+
+
 def int_or_none(elem: ET.Element, name: str) -> int | None:
-    t = text(elem, name)
+    t = _number_text(elem, name)
     if t is None:
         return None
     try:
@@ -170,9 +206,22 @@ def int_or_none(elem: ET.Element, name: str) -> int | None:
         raise MeterProtocolError(f"<{name}> is not an integer: {short(t)}") from err
 
 
+MAX_HREF = 1024  # no 2030.5 path comes close; an Itron agent's longest is ~25 characters
+
+
+def href_of(elem: ET.Element | None, default: str | None = None) -> str | None:
+    """An element's ``href`` attribute, refused past ``MAX_HREF`` characters
+    (it ends up in persisted profiles and error messages)."""
+    value = elem.get("href") if elem is not None else None
+    if value is None:
+        return default
+    if len(value) > MAX_HREF:
+        raise MeterProtocolError(f"href from meter is {len(value)} characters long: {short(value)}")
+    return value
+
+
 def link(elem: ET.Element, name: str) -> str | None:
-    c = child(elem, name)
-    return c.get("href") if c is not None else None
+    return href_of(child(elem, name))
 
 
 def expect_root(elem: ET.Element, name: str) -> None:
@@ -259,6 +308,7 @@ class DeviceCapability:
 
     @classmethod
     def from_xml(cls, root: ET.Element) -> DeviceCapability:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(root, "DeviceCapability")
         return cls(
             time_href=link(root, "TimeLink"),
@@ -270,6 +320,8 @@ class DeviceCapability:
 
 @dataclass(frozen=True, slots=True)
 class MeterTime:
+    """The meter's clock (Time): current time and offsets."""
+
     current_time: datetime
     tz_offset: int
     dst_offset: int
@@ -277,6 +329,7 @@ class MeterTime:
 
     @classmethod
     def from_xml(cls, root: ET.Element) -> MeterTime:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(root, "Time")
         current = epoch(int_or_none(root, "currentTime"))
         if current is None:
@@ -289,6 +342,7 @@ class MeterTime:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         return {
             "current_time": _iso(self.current_time),
             "tz_offset": self.tz_offset,
@@ -297,7 +351,9 @@ class MeterTime:
         }
 
     @classmethod
+    @restores
     def from_dict(cls, d: Mapping[str, Any]) -> MeterTime:
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         current = _from_iso(d["current_time"])
         if current is None:
             raise ValueError("current_time is required")
@@ -312,6 +368,7 @@ class SelfDevice:
 
     @classmethod
     def from_xml(cls, root: ET.Element) -> SelfDevice:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(root, "SelfDevice")
         return cls(
             sfdi=_sfdi(text(root, "sFDI")),
@@ -322,6 +379,8 @@ class SelfDevice:
 
 @dataclass(frozen=True, slots=True)
 class DeviceInformation:
+    """What the meter says about its hardware and software (DeviceInformation)."""
+
     lfdi: str | None
     manufacturer_id: int | None
     model: str | None
@@ -331,6 +390,7 @@ class DeviceInformation:
 
     @classmethod
     def from_xml(cls, root: ET.Element) -> DeviceInformation:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(root, "DeviceInformation")
         return cls(
             lfdi=text(root, "lFDI"),
@@ -365,9 +425,10 @@ class UsagePoint:
 
     @classmethod
     def from_xml(cls, elem: ET.Element) -> UsagePoint:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(elem, "UsagePoint")
         return cls(
-            href=elem.get("href", ""),
+            href=href_of(elem, "") or "",
             description=text(elem, "description"),
             service_category=int_or_none(elem, "serviceCategoryKind"),
             status=int_or_none(elem, "status"),
@@ -389,9 +450,10 @@ class MeterReadingInfo:
 
     @classmethod
     def from_xml(cls, elem: ET.Element) -> MeterReadingInfo:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(elem, "MeterReading")
         return cls(
-            href=elem.get("href", ""),
+            href=href_of(elem, "") or "",
             mrid=text(elem, "mRID"),
             description=text(elem, "description"),
             reading_type_href=link(elem, "ReadingTypeLink"),
@@ -413,6 +475,7 @@ class QualityFlags(enum.IntFlag):
 
     @property
     def is_estimated(self) -> bool:
+        """True if the meter estimated the value rather than measuring it."""
         return bool(self & (QualityFlags.ESTIMATED_REFERENCE_DAY | QualityFlags.ESTIMATED_LINEAR))
 
 
@@ -448,14 +511,24 @@ class ReadingType:
 
     @classmethod
     def from_xml(cls, root: ET.Element) -> ReadingType:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(root, "ReadingType")
-        values: dict[str, int | None] = {attr: int_or_none(root, tag) or 0 for attr, tag in cls._FIELDS}
-        values["power_of_ten_multiplier"] = int_in_range(root, "powerOfTenMultiplier", -128, 128) or 0  # Int8
+        # Bounded exactly like from_dict, so a profile discovery produced always loads again.
+        values: dict[str, int | None] = {
+            attr: (
+                int_in_range(root, tag, -128, 128)
+                if attr == "power_of_ten_multiplier"
+                else int_in_range(root, tag, 0, UINT32)
+            )
+            or 0
+            for attr, tag in cls._FIELDS
+        }
         values["interval_length"] = int_in_range(root, "intervalLength", 0, UINT32)
         return cls(**values)  # type: ignore[arg-type]
 
     @property
     def unit(self) -> str:
+        """The unit symbol for ``uom`` (e.g. "Wh"), or "" if unknown."""
         return UNIT_SYMBOLS.get(Uom(self.uom), "")
 
     def scale(self, raw: int | None) -> float | None:
@@ -467,11 +540,13 @@ class ReadingType:
         return float(raw * 10**p) if p >= 0 else raw / 10 ** (-p)
 
     def to_dict(self) -> dict[str, int | None]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         d: dict[str, int | None] = {tag: getattr(self, attr) for attr, tag in self._FIELDS}
         d["intervalLength"] = self.interval_length
         return d
 
     @classmethod
+    @restores
     def from_dict(cls, d: Mapping[str, int | None]) -> ReadingType:
         """Restore :meth:`to_dict` output, checked like :meth:`from_xml`;
         ``ProfileError`` if it is not (a cached profile from elsewhere)."""
@@ -506,6 +581,7 @@ class Reading:
 
     @classmethod
     def from_xml(cls, elem: ET.Element) -> Reading:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(elem, "Reading")
         period = child(elem, "timePeriod")
         start = duration = None
@@ -514,7 +590,7 @@ class Reading:
             duration = int_in_range(period, "duration", 0, UINT32)
         quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags", 4)
         return cls(
-            href=elem.get("href"),
+            href=href_of(elem),
             raw_value=int_in_range(elem, "value", -INT48, INT48),
             start=epoch(start),
             duration=duration,
@@ -527,6 +603,8 @@ class Reading:
 
 @dataclass(frozen=True, slots=True)
 class ReadingSetInfo:
+    """One stored ReadingSet of an interval channel: when it starts, how long, where its Readings are."""
+
     href: str
     description: str | None
     start: datetime | None
@@ -536,6 +614,7 @@ class ReadingSetInfo:
 
     @classmethod
     def from_xml(cls, elem: ET.Element) -> ReadingSetInfo:
+        """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(elem, "ReadingSet")
         period = child(elem, "timePeriod")
         start = duration = None
@@ -544,11 +623,11 @@ class ReadingSetInfo:
             duration = int_in_range(period, "duration", 0, UINT32)
         rl = child(elem, "ReadingListLink")
         return cls(
-            href=elem.get("href", ""),
+            href=href_of(elem, "") or "",
             description=text(elem, "description"),
             start=epoch(start),
             duration=duration,
-            reading_list_href=rl.get("href") if rl is not None else None,
+            reading_list_href=href_of(rl),
             reading_count=int_attr(rl, "all") if rl is not None and rl.get("all") else None,
         )
 
@@ -594,7 +673,9 @@ class Measurement:
         }
 
     @classmethod
+    @restores
     def from_dict(cls, d: Mapping[str, Any]) -> Measurement:
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         return cls(
             value=d["value"],
             unit=d["unit"],
@@ -618,6 +699,7 @@ class IntervalValue:
     quality: QualityFlags | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         return {
             "start": _iso(self.start),
             "end": _iso(self.end),
@@ -628,7 +710,9 @@ class IntervalValue:
         }
 
     @classmethod
+    @restores
     def from_dict(cls, d: Mapping[str, Any]) -> IntervalValue:
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         start, end = _from_iso(d["start"]), _from_iso(d["end"])
         if start is None or end is None:
             raise ValueError("an interval needs a start and an end")
@@ -710,6 +794,7 @@ class TouRegister(Mapping[int, Measurement]):
 
     @property
     def total(self) -> Measurement | None:
+        """Tier 0: the register's total across tiers, if the meter gave it."""
         return self._tiers.get(0)
 
     @property
@@ -718,10 +803,13 @@ class TouRegister(Mapping[int, Measurement]):
         return {t: m for t, m in self._tiers.items() if t > 0 and m.value is not None}
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, for caches, fixtures and diagnostics."""
         return {str(t): m.to_dict() for t, m in self._tiers.items()}
 
     @classmethod
+    @restores
     def from_dict(cls, d: Mapping[str, Any]) -> TouRegister:
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
         return cls({int(t): Measurement.from_dict(m) for t, m in d.items()})
 
 
@@ -737,10 +825,12 @@ class HourlyEnergy:
 
     @property
     def end(self) -> datetime:
+        """The end of the hour."""
         return self.start + timedelta(hours=1)
 
     @property
     def complete(self) -> bool:
+        """True if intervals cover the whole hour."""
         return self.covered == 3600
 
 
@@ -750,7 +840,8 @@ def hourly_energy(values: Iterable[IntervalValue], *, complete_only: bool = True
 
     Every interval must lie within one clock hour (2030.5 intervals are
     aligned; 15 minutes on an Itron) and share one unit; overlapping
-    intervals are an error. Exact duplicates count once. Intervals without a
+    intervals are an error. Exact duplicates count once (the later one, e.g. a
+    corrected re-read, wins). Intervals without a
     value or flagged questionable are left out, which leaves their hour
     incomplete; ``complete_only`` drops such hours. Raises ``ValueError``.
     """
@@ -765,9 +856,13 @@ def hourly_energy(values: Iterable[IntervalValue], *, complete_only: bool = True
             raise ValueError(f"intervals mix units: {unit} and {v.unit}")
         start, end = v.start.astimezone(UTC), v.end.astimezone(UTC)
         hour = start.replace(minute=0, second=0, microsecond=0)
-        if end <= start or end > hour + timedelta(hours=1):
+        try:
+            hour_end = hour + timedelta(hours=1)
+        except OverflowError:
+            raise ValueError(f"interval at {start:%Y-%m-%d %H:%M} is past the calendar's end") from None
+        if end <= start or end > hour_end:
             raise ValueError(f"interval {start:%Y-%m-%d %H:%M}-{end:%H:%M} is not within one clock hour")
-        by_hour.setdefault(hour, {}).setdefault((start, end), v)
+        by_hour.setdefault(hour, {})[(start, end)] = v
     out = []
     for hour, intervals in sorted(by_hour.items()):
         spans = sorted(intervals)
@@ -819,6 +914,7 @@ __all__ = [
     "Measurement",
     "MeterTime",
     "QualityFlags",
+    "Reading",
     "ReadingSetInfo",
     "ReadingType",
     "TouRegister",

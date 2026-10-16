@@ -32,6 +32,7 @@ __all__ = [
     "ProfileError",
 ]
 
+# Why the meter refused our certificate: the values of MeterAuthError.reason.
 AuthReason = Literal[
     "certificate_rejected",
     "certificate_expired",
@@ -70,11 +71,16 @@ class MeterIdentityMismatch(MeterError):
     """
 
     def __init__(self, host: str, expected: str, actual: str | None) -> None:
-        who = f"LFDI {actual}" if actual else "a device that did not prove its identity"
-        super().__init__(f"{host} is not the expected meter: {who}, expected {expected}")
+        # The message shortens the LFDIs (logs get pasted into public issues);
+        # the attributes keep them whole.
+        who = f"LFDI {actual[:10]}..." if actual else "a device that did not prove its identity"
+        super().__init__(f"{host} is not the expected meter: {who}, expected {expected[:10]}...")
         self.host = host
         self.expected = expected
         self.actual = actual
+
+    def __reduce__(self) -> tuple[type, tuple[str, str, str | None]]:
+        return type(self), (self.host, self.expected, self.actual)
 
 
 class MeterAuthError(MeterError):
@@ -96,6 +102,9 @@ class MeterAuthError(MeterError):
         super().__init__(message)
         self.reason: AuthReason = reason
 
+    def __reduce__(self) -> tuple[type, tuple[str, AuthReason]]:
+        return type(self), (str(self), self.reason)
+
 
 class MeterProtocolError(MeterError):
     """The meter answered, but not with something we understand."""
@@ -108,6 +117,9 @@ class InvalidIdentity(MeterError):
     def __init__(self, message: str, problems: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.problems = problems
+
+    def __reduce__(self) -> tuple[type, tuple[str, tuple[str, ...]]]:
+        return type(self), (str(self), self.problems)
 
 
 class ProfileError(MeterError):
@@ -122,6 +134,10 @@ class MeterHttpError(MeterProtocolError):
         super().__init__(f"GET {path} -> HTTP {status} {reason}".rstrip())
         self.path = path
         self.status = status
+        self.reason = reason
+
+    def __reduce__(self) -> tuple[type, tuple[str, int, str]]:
+        return type(self), (self.path, self.status, self.reason)
 
 
 class MeterNotFound(MeterHttpError):

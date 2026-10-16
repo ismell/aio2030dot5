@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from aio2030dot5 import MeterConnectionError, MeterProtocolError, ProfileError, ReadingType
+from aio2030dot5 import MeterProtocolError, ProfileError, ReadingType
 from aio2030dot5.models import MAX_TEXT, Reading, ReadingSetInfo, add_seconds, interval_values, parse_xml, text
 from aio2030dot5.profile import MAX_LIST_ITEMS
 
@@ -71,7 +71,7 @@ async def test_content_length_must_be_plain_digits(pki: Pki, length: bytes) -> N
 
 
 async def test_an_unframed_body_cut_without_close_notify_is_not_trusted(pki: Pki) -> None:
-    with pytest.raises(MeterConnectionError):
+    with pytest.raises(MeterProtocolError):  # unusable, not an outage: no back-off loop
         await _get(pki, OK + b"Connection: close\r\n\r\npartial", close_notify=False)
 
 
@@ -199,3 +199,83 @@ def test_pem_must_be_text_or_bytes() -> None:
 
     with pytest.raises(InvalidIdentity):
         build_ssl_context_from_pem(10**9, b"")  # type: ignore[arg-type]  # not a gigabyte of zeros
+
+
+@pytest.mark.parametrize("encoding", ["utf-32", "shift_jis", "nosuch"])
+def test_an_unreadable_declared_encoding_is_a_protocol_error(encoding: str) -> None:
+    with pytest.raises(MeterProtocolError):
+        parse_xml(f'<?xml version="1.0" encoding="{encoding}"?><Time {NS}/>'.encode())
+
+
+def test_an_absurdly_long_href_is_refused() -> None:
+    from aio2030dot5.models import MAX_HREF, link
+    from aio2030dot5.profile import resolve_href
+
+    root = parse_xml(f'<R {NS}><TimeLink href="/{"t" * MAX_HREF}"/></R>')
+    with pytest.raises(MeterProtocolError) as exc:
+        link(root, "TimeLink")
+    assert len(str(exc.value)) < 200  # and the message stays short
+    with pytest.raises(MeterProtocolError):
+        resolve_href("/dcap", "/" + "x" * (MAX_HREF + 1), "192.0.2.19", 8081)
+
+
+async def test_one_page_claiming_too_many_items_is_refused(pki: Pki) -> None:
+    from aio2030dot5.profile import get_list
+
+    sctx = server_ctx(pki)
+    items = "".join(f'<ReadingSet href="/rs/{i}"/>' for i in range(MAX_LIST_ITEMS + 1))
+    body = f'<ReadingSetList {NS} all="{MAX_LIST_ITEMS + 1}" results="{MAX_LIST_ITEMS + 1}">{items}</ReadingSetList>'
+
+    def handler(raw):  # type: ignore[no-untyped-def]
+        tls = sctx.wrap_socket(raw, server_side=True)
+        while read_request(tls):
+            data = body.encode()
+            tls.sendall(OK + b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+
+    with Server(handler) as srv:
+        meter = make_meter(pki, srv.port)
+        with pytest.raises(MeterProtocolError):
+            async with meter._transport.batch() as b:
+                await get_list(b, "/rs", "ReadingSet")
+
+
+async def test_a_zero_padded_chunk_size_is_fine(pki: Pki) -> None:
+    body = b"000000005\r\nhello\r\n0000\r\n\r\n"
+    assert await _get(pki, OK + b"Transfer-Encoding: chunked\r\n\r\n" + body) == b"hello"
+
+
+def test_numbers_too_long_for_any_type_are_refused_not_truncated() -> None:
+    with pytest.raises(MeterProtocolError):
+        Reading.from_xml(parse_xml(f"<Reading {NS}><value>{'0' * 1100}5</value></Reading>"))
+
+
+def test_a_flood_of_elements_is_refused() -> None:
+    from aio2030dot5.models import MAX_ELEMENTS
+
+    with pytest.raises(MeterProtocolError):
+        parse_xml(f"<R {NS}>" + "<a/>" * (MAX_ELEMENTS + 1) + "</R>")
+
+
+@pytest.mark.parametrize("field", ["phase", "numberOfTouTiers", "kind"])
+def test_a_discovered_reading_type_is_bounded_like_a_cached_one(field: str) -> None:
+    with pytest.raises(MeterProtocolError):
+        ReadingType.from_xml(parse_xml(f"<ReadingType {NS}><{field}>{2**40}</{field}></ReadingType>"))
+
+
+def test_exceptions_survive_copy_and_pickle() -> None:
+    import copy
+    import pickle
+
+    from aio2030dot5 import InvalidIdentity, MeterAuthError, MeterHttpError, MeterIdentityMismatch, MeterNotFound
+
+    errors = [
+        MeterIdentityMismatch("192.0.2.19", "A" * 40, "B" * 40),
+        MeterNotFound("/upt/1", 404),
+        MeterHttpError("/upt/1", 500, "Oops"),
+        MeterAuthError("refused", "http_403"),
+        InvalidIdentity("bad", ("why",)),
+    ]
+    for err in errors:
+        for again in (copy.copy(err), pickle.loads(pickle.dumps(err))):
+            assert type(again) is type(err) and str(again) == str(err) and vars(again) == vars(err)
+    assert "A" * 40 not in str(errors[0])  # the message shortens the LFDIs

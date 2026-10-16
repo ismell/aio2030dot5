@@ -56,12 +56,13 @@ _READ_SIZE = 16384
 _MAX_HEADER_BYTES = 16384
 _MAX_BODY_BYTES = 4 * 1024 * 1024
 _MAX_CHUNK_LINE_BYTES = 1024
+_MAX_TARGET = 2048  # a resolved href plus our paging query
 _COMPACT_AFTER = 256 * 1024
 _CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")
 
 
-def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+def build_ssl_context(cert_path: str | os.PathLike[str], key_path: str | os.PathLike[str]) -> ssl.SSLContext:
     """TLS client context for an IEEE 2030.5 HAN meter, from PEM files.
 
     Blocking (reads the cert and key files): call it from an executor in an
@@ -159,6 +160,7 @@ class TransportStats:
     last_handshake_ms: int | None = None
 
     def to_dict(self) -> dict[str, int | None]:
+        """The counters, e.g. for diagnostics (output only: there is no from_dict)."""
         return {
             "requests": self.requests,
             "connections": self.connections,
@@ -198,6 +200,7 @@ class PeerCertificate:
 
     @classmethod
     def from_chain(cls, chain: tuple[bytes, ...]) -> PeerCertificate:
+        """The identity a certificate chain (leaf first) implies."""
         lfdi = lfdi_from_der(chain[0])
         return cls(der=chain[0], chain=chain, lfdi=lfdi, sfdi=sfdi_from_lfdi(lfdi))
 
@@ -489,25 +492,28 @@ class _TlsConnection:
             length = int(headers["content-length"])
             if length > _MAX_BODY_BYTES:
                 raise MeterProtocolError(f"bad Content-Length {length}")
-            while len(rest) < length:
+            body_buf = bytearray(rest)
+            while len(body_buf) < length:
                 chunk = await self._recv_some()
                 if not chunk:
                     raise MeterConnectionError("meter closed the connection mid-body")
-                rest += chunk
-            body, self._buffer = rest[:length], rest[length:]
+                body_buf += chunk
+            body, self._body_buffer = bytes(body_buf[:length]), bytes(body_buf[length:])
         else:
             # No framing: the body runs to EOF and the connection is spent.
+            body_buf = bytearray(rest)
             while True:
                 chunk = await self._recv_some()
                 if not chunk:
                     break
-                rest += chunk
-                if len(rest) > _MAX_BODY_BYTES:
+                body_buf += chunk
+                if len(body_buf) > _MAX_BODY_BYTES:
                     raise MeterProtocolError("HTTP body too large")
+            rest = bytes(body_buf)
             if self.truncated:
                 # EOF is the only framing here, so an EOF without close_notify
                 # may have cut the body short.
-                raise MeterConnectionError("meter closed the connection without close_notify mid-body")
+                raise MeterProtocolError("meter ended an unframed body without close_notify: it may be cut short")
             body, self._buffer, keep_alive = rest, b"", False
 
         return Response(status, reason[0] if reason else "", headers, body, keep_alive and not self.eof)
@@ -522,6 +528,7 @@ class _TlsConnection:
         while True:
             line_end = await self._fill_until(buf, b"\r\n", pos, _MAX_CHUNK_LINE_BYTES, "chunk size line")
             size_field = bytes(buf[pos:line_end]).split(b";", 1)[0].strip(b" \t")
+            size_field = size_field.lstrip(b"0") or b"0"  # 1*HEXDIG may be zero-padded
             if not _CHUNK_SIZE.fullmatch(size_field):
                 raise MeterProtocolError(f"bad chunk size {short(size_field)}")
             size = int(size_field, 16)
@@ -668,7 +675,7 @@ class _Shared:
 _SHARED: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, int], _Shared]] = (
     weakref.WeakKeyDictionary()
 )
-_SHARED_STRONG: dict[int, dict[tuple[str, int], _Shared]] = {}  # loops that refuse weak references
+_SHARED_STRONG: dict[int, tuple[asyncio.AbstractEventLoop, dict[tuple[str, int], _Shared]]] = {}
 
 
 def _shared(address: str, port: int) -> _Shared:
@@ -677,7 +684,11 @@ def _shared(address: str, port: int) -> _Shared:
     try:
         per_loop = _SHARED.setdefault(loop, {})
     except TypeError:
-        per_loop = _SHARED_STRONG.setdefault(id(loop), {})
+        # A loop that refuses weak references is kept by id, together with the
+        # loop itself so the id cannot be reused by another loop while stored.
+        for stale in [k for k, (lp, _) in _SHARED_STRONG.items() if lp.is_closed()]:
+            del _SHARED_STRONG[stale]
+        per_loop = _SHARED_STRONG.setdefault(id(loop), (loop, {}))[1]
     return per_loop.setdefault((address.lower(), port), _Shared())
 
 
@@ -768,8 +779,12 @@ class MeterTransport:
     def forget_session(self) -> None:
         self._session = None
 
-    async def _connect(self, *, verify: bool = True, deadline: asyncio.Timeout | None = None) -> _TlsConnection:
-        shared = self._state()
+    async def _connect(
+        self, *, verify: bool = True, deadline: asyncio.Timeout | None = None, shared: _Shared | None = None
+    ) -> _TlsConnection:
+        # A batch passes the state it locked: re-resolving the host name meanwhile
+        # (another task, after the TTL) must not switch pacing to another meter's.
+        shared = shared or self._state()
         task = asyncio.current_task()
         if shared.owner is not None and task is not None and shared.owner is not task:
             raise RuntimeError("a Batch must be used from the task that opened it")
@@ -875,7 +890,7 @@ class MeterTransport:
         async with shared.lock:
             shared.owner = task
             deadline = asyncio.timeout(self.timeouts.batch)
-            b = Batch(self, verify_identity, deadline)
+            b = Batch(self, verify_identity, deadline, shared)
             try:
                 try:
                     async with deadline:
@@ -906,9 +921,14 @@ class Batch:
     """GETs on one connection. Created only by :meth:`MeterTransport.batch`."""
 
     def __init__(
-        self, transport: MeterTransport, verify_identity: bool = True, deadline: asyncio.Timeout | None = None
+        self,
+        transport: MeterTransport,
+        verify_identity: bool = True,
+        deadline: asyncio.Timeout | None = None,
+        shared: _Shared | None = None,
     ) -> None:
         self._t = transport
+        self._shared = shared  # the meter state whose lock this batch holds
         self._verify = verify_identity
         self._deadline = deadline
         self._conn: _TlsConnection | None = None
@@ -947,7 +967,7 @@ class Batch:
             if self._conn is None:
                 if self._closed:  # the batch ended while close() ran
                     raise RuntimeError("Batch used after its batch() block exited")
-                self._conn = await self._t._connect(verify=self._verify, deadline=self._deadline)
+                self._conn = await self._t._connect(verify=self._verify, deadline=self._deadline, shared=self._shared)
                 self._peer = self._t.peer
         finally:
             self._busy = False
@@ -1006,7 +1026,7 @@ class Batch:
                 # left running by gather()): connecting now would be outside
                 # the lock, beside whatever holds it.
                 raise RuntimeError("Batch used after its batch() block exited")
-            self._conn = await t._connect(verify=self._verify, deadline=self._deadline)
+            self._conn = await t._connect(verify=self._verify, deadline=self._deadline, shared=self._shared)
             self._peer = t.peer
         conn = self._conn
         host = _host_header(t.host, t.port)
@@ -1044,13 +1064,13 @@ class Batch:
             try:
                 await conn.close()
             finally:
-                self._t._state().last_close = time.monotonic()
+                (self._shared or self._t._state()).last_close = time.monotonic()
 
     def _kill(self) -> None:
         if self._conn is not None:
             conn, self._conn = self._conn, None
             conn.abort()
-            self._t._state().last_close = time.monotonic()
+            (self._shared or self._t._state()).last_close = time.monotonic()
 
 
 # Reconnect instead of reusing a connection idle this long (the meter closes
@@ -1062,8 +1082,14 @@ def _request_target(path: str) -> str:
     """Validate a request target taken from meter XML: an origin-form path of
     printable ASCII. Anything else is a protocol error, never a header
     injection or a request to another host."""
-    if not path.startswith("/") or not path.isascii() or not path.isprintable() or " " in path:
-        raise MeterProtocolError(f"unusable href from meter: {path!r}")
+    if (
+        len(path) > _MAX_TARGET
+        or not path.startswith("/")
+        or not path.isascii()
+        or not path.isprintable()
+        or " " in path
+    ):
+        raise MeterProtocolError(f"unusable href from meter: {short(path)}")
     return path
 
 

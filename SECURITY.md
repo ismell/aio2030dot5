@@ -15,13 +15,19 @@ is scoped to the meter connection's own `SSLContext` and never affects other TLS
 in your process.
 
 Instead, the meter is authenticated by **pinning its LFDI**, which in IEEE 2030.5
-is the SHA-256 of its certificate. Every connection compares the certificate the
-device presents with `expected_lfdi` before any request is sent, and raises
+is the leftmost 160 bits of the SHA-256 of its certificate. Every connection
+compares the certificate the device presents with `expected_lfdi` before any
+request is sent, and raises
 `MeterIdentityMismatch` on a difference. Pass `expected_lfdi` when you know it.
 If you do not, the first `discover()` pins whatever device answers (trust on
-first use), and `probe_tls()` / `probe()` never pin. Before trusting a device you
-found by mDNS, compare `probe_tls().sfdi` with the SFDI the meter advertises or
-prints.
+first use), and `probe_tls()` / `probe()` never pin.
+
+At first contact, compare `probe_tls().sfdi` with the SFDI printed on the meter
+or shown by the utility's portal -- not the one in the mDNS advertisement, which
+any device can claim. That catches a wrong or neighbouring meter. It does not
+stop an active attacker on your network: the SFDI is only 36 bits of the
+certificate's hash, and the certificate's signature is not checked, so a device
+can be made to match it. First contact is trust on first use.
 
 ## Your private key
 

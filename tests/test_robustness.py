@@ -17,17 +17,9 @@ from aio2030dot5 import transport as T
 from aio2030dot5.models import ListPage, Reading, parse_xml
 
 from .conftest import Pki, make_meter
-from .meter_server import FakeMeter, FixtureTree
+from .helpers import SlowTree
+from .meter_server import FakeMeter
 from .scripted_server import Server, read_request, rst, server_ctx
-
-
-class SlowTree(FixtureTree):
-    """Answers requests whose target contains "slow" after 0.5 s."""
-
-    def respond(self, target: str) -> tuple[int, str]:
-        if "slow" in target:
-            time.sleep(0.5)
-        return super().respond(target)
 
 
 async def test_cancelled_get_never_desyncs_the_batch(pki: Pki, monkeypatch: pytest.MonkeyPatch) -> None:

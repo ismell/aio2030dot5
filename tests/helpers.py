@@ -3,10 +3,13 @@ builder, and the client identity the fake meter accepts."""
 
 from __future__ import annotations
 
+import time
+
 from aio2030dot5 import Identity, ReadingType, load_identity
 from aio2030dot5.models import parse_xml
 
 from .conftest import Pki
+from .meter_server import FixtureTree
 
 NS = "urn:ieee:std:2030.5:ns"
 
@@ -44,3 +47,12 @@ PINNED_KEYS_3_2_50 = [
 
 def registered(pki: Pki) -> Identity:
     return load_identity(pki.client_cert.read_text(), pki.client_key.read_text())
+
+
+class SlowTree(FixtureTree):
+    """Answers requests whose target contains "slow" after 0.5 s."""
+
+    def respond(self, target: str) -> tuple[int, str]:
+        if "slow" in target:
+            time.sleep(0.5)
+        return super().respond(target)
