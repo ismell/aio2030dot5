@@ -1,3 +1,5 @@
+"""The transport and the Meter against the fake meter: discovery, reads, keep-alive and session resumption."""
+
 from __future__ import annotations
 
 import asyncio

@@ -1,6 +1,6 @@
-"""Regression tests from the 2026-10-06 review: cancellation, misuse, resets,
-odd framing and malformed input must never desync a connection, open a
-second one, or escape as anything but a MeterError."""
+"""Robustness: cancellation, misuse, resets, odd framing and malformed input
+must never desync a connection, open a second one, or escape as anything but
+a MeterError."""
 
 from __future__ import annotations
 

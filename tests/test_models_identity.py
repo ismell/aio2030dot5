@@ -1,3 +1,5 @@
+"""Parsing resources from real captures, and client identities (generation, checks, LFDI/SFDI)."""
+
 from __future__ import annotations
 
 import json

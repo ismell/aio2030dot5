@@ -18,8 +18,8 @@ from aio2030dot5.models import SelfDevice, parse_xml
 from aio2030dot5.profile import classify, resolve_href
 
 from .conftest import Pki, make_meter
+from .helpers import NS, PINNED_KEYS_3_2_50, rt
 from .meter_server import FakeMeter, FixtureTree
-from .test_round2 import NS, PINNED_KEYS_3_2_50, rt
 
 
 class ReadingListTree(FixtureTree):
