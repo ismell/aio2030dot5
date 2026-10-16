@@ -227,7 +227,7 @@ class StatusTree(FixtureTree):
 async def test_http_status_classification(pki: Pki, status: int, exc_type: type[Exception]) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=StatusTree(status)) as fm:
         with pytest.raises(exc_type):
-            await make_meter(pki, fm.port).transport.get("/tm")
+            await make_meter(pki, fm.port)._transport.get("/tm")
 
 
 # -- one connection across Meter objects ------------------------------------------
@@ -243,9 +243,9 @@ async def test_two_meter_objects_share_one_connection_slot(pki: Pki, fake_meter:
 async def test_connects_are_spaced_from_the_last_close(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port, min_connect_interval=0.4)
     loop = asyncio.get_running_loop()
-    await meter.transport.get("/dcap")
+    await meter._transport.get("/dcap")
     t0 = loop.time()
-    await meter.transport.get("/tm")
+    await meter._transport.get("/tm")
     assert loop.time() - t0 >= 0.35
 
 

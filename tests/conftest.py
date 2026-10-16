@@ -72,9 +72,9 @@ def fake_meter(pki: Pki) -> Iterator[FakeMeter]:
 FAST = Timeouts(connect=2.0, handshake=2.0, response=2.0)
 
 
-def make_meter(pki: Pki, port: int, **kwargs: object) -> Meter:
+def make_meter(pki: Pki, port: int, host: str = "127.0.0.1", **kwargs: object) -> Meter:
     ctx = build_ssl_context(str(pki.client_cert), str(pki.client_key))
     kwargs.setdefault("timeouts", FAST)
     kwargs.setdefault("min_connect_interval", 0.0)
     kwargs.setdefault("request_spacing", 0.0)
-    return Meter("127.0.0.1", ctx, port, **kwargs)  # type: ignore[arg-type]
+    return Meter(host, ctx, port, **kwargs)  # type: ignore[arg-type]

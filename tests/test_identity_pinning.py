@@ -29,7 +29,7 @@ def server_lfdi(pki: Pki) -> str:
 
 def unregistered(pki: Pki, port: int, **kwargs: object):  # type: ignore[no-untyped-def]
     meter = make_meter(pki, port, **kwargs)
-    meter.transport._ctx = build_ssl_context(str(pki.other_client_cert), str(pki.other_client_key))
+    meter._transport._ctx = build_ssl_context(str(pki.other_client_cert), str(pki.other_client_key))
     return meter
 
 
@@ -60,7 +60,7 @@ async def test_a_profile_from_another_meter_is_refused(pki: Pki, fake_meter: Fak
 async def test_another_device_at_the_address_gets_no_request(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port, expected_lfdi="A" * 40)
     with pytest.raises(MeterIdentityMismatch) as exc:
-        await meter.transport.get("/dcap")
+        await meter._transport.get("/dcap")
     assert (exc.value.expected, exc.value.actual) == ("A" * 40, server_lfdi(pki))
     assert fake_meter.log.requests == []
 
@@ -74,7 +74,7 @@ async def test_a_meter_replaced_at_the_same_address_is_detected(pki: Pki, tmp_pa
         meter = make_meter(pki, a.port)
         profile = await meter.discover()
         # The meter's address now answers with a different device (a DHCP reshuffle).
-        meter.transport.port = b.port
+        meter._transport.port = b.port
         with pytest.raises(MeterIdentityMismatch):
             await meter.read(profile, profile.channels[:1])
         assert b.log.requests == []
@@ -85,10 +85,10 @@ async def test_resumed_connections_are_checked_too(pki: Pki, fake_meter: FakeMet
     profile = await meter.discover()
     await meter.read(profile, profile.channels[:1])
     assert fake_meter.log.resumed >= 1
-    assert meter.transport.peer is not None and meter.transport.peer.lfdi == server_lfdi(pki)
-    meter.transport.expected_lfdi = "A" * 40
+    assert meter._transport.peer is not None and meter._transport.peer.lfdi == server_lfdi(pki)
+    meter._transport.expected_lfdi = "A" * 40
     with pytest.raises(MeterIdentityMismatch):
-        await meter.transport.get("/dcap")
+        await meter._transport.get("/dcap")
 
 
 async def test_probe_tls_with_a_registered_certificate(pki: Pki, fake_meter: FakeMeter) -> None:
@@ -114,12 +114,12 @@ async def test_probe_tls_ignores_the_pin(pki: Pki, fake_meter: FakeMeter) -> Non
 
 async def test_refused_by_our_meter_is_an_auth_error(pki: Pki, fake_meter: FakeMeter) -> None:
     with pytest.raises(MeterAuthError):
-        await unregistered(pki, fake_meter.port, expected_lfdi=server_lfdi(pki)).transport.get("/dcap")
+        await unregistered(pki, fake_meter.port, expected_lfdi=server_lfdi(pki))._transport.get("/dcap")
 
 
 async def test_refused_by_another_device_is_a_mismatch_not_an_auth_error(pki: Pki, fake_meter: FakeMeter) -> None:
     with pytest.raises(MeterIdentityMismatch):
-        await unregistered(pki, fake_meter.port, expected_lfdi="A" * 40).transport.get("/dcap")
+        await unregistered(pki, fake_meter.port, expected_lfdi="A" * 40)._transport.get("/dcap")
 
 
 def test_expected_lfdi_must_be_an_lfdi(pki: Pki) -> None:

@@ -77,15 +77,15 @@ async def replayer(fake_meter: FakeMeter) -> AsyncIterator[int]:
 async def test_a_replayed_certificate_is_not_the_meter(pki: Pki, fake_meter: FakeMeter, replayer: int) -> None:
     pinned = make_meter(pki, replayer, expected_lfdi=fake_meter.lfdi)
     with pytest.raises(MeterIdentityMismatch):  # not MeterAuthError (which means: re-register)
-        await pinned.transport.get("/dcap")
-    assert pinned.transport.peer is None
+        await pinned._transport.get("/dcap")
+    assert pinned._transport.peer is None
     with pytest.raises(MeterAuthError):  # probe_tls cannot say who refused
         await make_meter(pki, replayer).probe_tls()
 
 
 async def test_a_real_refusal_still_identifies_the_meter(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port)
-    meter.transport._ctx = build_ssl_context(str(pki.other_client_cert), str(pki.other_client_key))
+    meter._transport._ctx = build_ssl_context(str(pki.other_client_cert), str(pki.other_client_key))
     info = await meter.probe_tls()
     assert not info.client_accepted and info.lfdi == fake_meter.lfdi
 
@@ -143,7 +143,7 @@ def test_an_encrypted_key_is_invalid_identity_not_a_prompt(pki: Pki, tmp_path: P
 
 async def test_batch_connect_from_another_task_never_connects(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port)
-    async with meter.transport.batch() as b:
+    async with meter._transport.batch() as b:
         results = await asyncio.gather(b.connect(), b.get("/dcap"), return_exceptions=True)
         stray = asyncio.create_task(b.connect())
         await asyncio.sleep(0)
@@ -159,12 +159,12 @@ async def test_batch_connect_from_another_task_never_connects(pki: Pki, fake_met
 
 async def test_connection_pacing_does_not_count_against_the_deadline(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port, min_connect_interval=1.0, timeouts=Timeouts(2, 2, 2, batch=0.8))
-    await meter.transport.get("/dcap")
-    await meter.transport.get("/tm")  # waits ~1 s for pacing, within a 0.8 s deadline
+    await meter._transport.get("/dcap")
+    await meter._transport.get("/tm")  # waits ~1 s for pacing, within a 0.8 s deadline
     profile = await meter.discover()
     ch = profile.find(Quantity.ENERGY, Statistic.INTERVAL, Direction.DELIVERED)
     assert ch is not None
-    meter.transport.timeouts = Timeouts(2, 2, 2, batch=3.0)
+    meter._transport.timeouts = Timeouts(2, 2, 2, batch=3.0)
     await meter.read_intervals_since(ch, datetime.now(UTC) - timedelta(days=1))  # two batches, paced
 
 

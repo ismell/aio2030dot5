@@ -1,4 +1,45 @@
-"""Exceptions. Consumers decide policy (backoff, rediscovery, user alerts) from these."""
+"""Exceptions. Consumers decide policy (backoff, rediscovery, user alerts) from these.
+
+::
+
+    MeterError
+    ├── MeterConnectionError        back off and retry
+    │   ├── MeterTimeout
+    │   └── MeterBusy
+    ├── MeterIdentityMismatch       another device at this address: locate the meter again
+    ├── MeterAuthError              our certificate is refused: the user must act
+    ├── MeterProtocolError          the meter answered something we cannot use
+    │   └── MeterHttpError
+    │       └── MeterNotFound       a cached path is gone: rediscover
+    ├── ProfileError                a cached profile is unusable: rediscover
+    └── InvalidIdentity             a certificate/key we cannot use
+"""
+
+from typing import Literal
+
+__all__ = [
+    "AuthReason",
+    "InvalidIdentity",
+    "MeterAuthError",
+    "MeterBusy",
+    "MeterConnectionError",
+    "MeterError",
+    "MeterHttpError",
+    "MeterIdentityMismatch",
+    "MeterNotFound",
+    "MeterProtocolError",
+    "MeterTimeout",
+    "ProfileError",
+]
+
+AuthReason = Literal[
+    "certificate_rejected",
+    "certificate_expired",
+    "certificate_revoked",
+    "access_denied",
+    "http_401",
+    "http_403",
+]
 
 
 class MeterError(Exception):
@@ -20,7 +61,7 @@ class MeterBusy(MeterConnectionError):
     """The meter answered 429/503: it is overloaded. Back off like for an outage."""
 
 
-class MeterIdentityMismatch(MeterConnectionError):
+class MeterIdentityMismatch(MeterError):
     """The device at this address is not the expected meter: its certificate's
     LFDI differs (or it presented none). The meter moved -- e.g. a new DHCP
     lease -- or another device took its address. Locate the meter again (by
@@ -51,9 +92,9 @@ class MeterAuthError(MeterError):
     * ``"http_401"``, ``"http_403"`` -- servers that authorise at the HTTP layer.
     """
 
-    def __init__(self, message: str, reason: str = "certificate_rejected") -> None:
+    def __init__(self, message: str, reason: AuthReason = "certificate_rejected") -> None:
         super().__init__(message)
-        self.reason = reason
+        self.reason: AuthReason = reason
 
 
 class MeterProtocolError(MeterError):

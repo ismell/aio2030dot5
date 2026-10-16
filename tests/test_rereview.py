@@ -38,7 +38,7 @@ from .test_round2 import NS, PINNED_KEYS_3_2_50, rt
 async def test_request_in_flight_when_its_batch_ends_cannot_connect(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=SlowTree()) as fm:
         meter = make_meter(pki, fm.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             await b.get("/dcap")
             # A second request on the now-reused connection, left running past
             # the batch (e.g. by gather()). The batch's exit kills its
@@ -64,31 +64,31 @@ async def test_a_failed_handshake_still_spaces_the_next_connect(pki: Pki) -> Non
         meter = make_meter(pki, srv.port, min_connect_interval=0.4)
         for _ in range(2):
             with pytest.raises(MeterConnectionError):
-                await meter.transport.get("/dcap")
+                await meter._transport.get("/dcap")
     assert accepts[1] - accepts[0] >= 0.85  # 0.5 s handshake + 0.4 s spacing from its end
 
 
 async def test_session_survives_a_network_failure(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port)
-    await meter.transport.get("/dcap")
+    await meter._transport.get("/dcap")
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     dead = s.getsockname()[1]
     s.close()
-    meter.transport.port = dead  # the meter "drops off the network"
+    meter._transport.port = dead  # the meter "drops off the network"
     with pytest.raises(MeterConnectionError):
-        await meter.transport.get("/dcap")
-    meter.transport.port = fake_meter.port
-    await meter.transport.get("/tm")
+        await meter._transport.get("/dcap")
+    meter._transport.port = fake_meter.port
+    await meter._transport.get("/tm")
     assert fake_meter.log.resumed == 1  # the first connect after the outage resumed
 
 
 async def test_nested_batch_on_the_same_meter_raises_instead_of_hanging(pki: Pki, fake_meter: FakeMeter) -> None:
     a, b = make_meter(pki, fake_meter.port), make_meter(pki, fake_meter.port)
-    async with a.transport.batch():
+    async with a._transport.batch():
         with pytest.raises(RuntimeError):
             async with asyncio.timeout(2):
-                await b.transport.get("/dcap")
+                await b._transport.get("/dcap")
 
 
 @pytest.mark.parametrize(
@@ -109,7 +109,7 @@ async def test_odd_framing_is_a_protocol_error(pki: Pki, response: bytes) -> Non
 
     with Server(handler) as srv:
         with pytest.raises(MeterProtocolError) as exc:
-            await make_meter(pki, srv.port).transport.get("/x")
+            await make_meter(pki, srv.port)._transport.get("/x")
     # A framing error, not an HTTP status surfacing as one.
     assert not isinstance(exc.value, MeterHttpError)
 

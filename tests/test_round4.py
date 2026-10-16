@@ -21,22 +21,20 @@ HOUR = 3600.0
 
 async def test_two_names_for_one_meter_share_one_connection_slot(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=SlowTree()) as fm:
-        by_name, by_ip = make_meter(pki, fm.port), make_meter(pki, fm.port)
-        by_name.transport.host = by_name.host = "localhost"
+        by_name, by_ip = make_meter(pki, fm.port, host="localhost"), make_meter(pki, fm.port)
         await asyncio.gather(
-            by_name.transport.get("/dcap?slow=1"), by_ip.transport.get("/tm?slow=1"), by_name.transport.get("/tm")
+            by_name._transport.get("/dcap?slow=1"), by_ip._transport.get("/tm?slow=1"), by_name._transport.get("/tm")
         )
         assert fm.log.max_concurrent == 1
-        async with by_ip.transport.batch():
+        async with by_ip._transport.batch():
             with pytest.raises(RuntimeError):  # the same meter: nesting would deadlock
-                await by_name.transport.get("/dcap")
+                await by_name._transport.get("/dcap")
 
 
 async def test_an_unresolvable_name_is_its_own_key(pki: Pki) -> None:
-    meter = make_meter(pki, 9)
-    meter.transport.host = "no-such-host.invalid"
-    state = await meter.transport._resolve()
-    assert state is meter.transport._state()
+    meter = make_meter(pki, 9, host="no-such-host.invalid")
+    state = await meter._transport._resolve()
+    assert state is meter._transport._state()
 
 
 # -- helpers ---------------------------------------------------------------------------

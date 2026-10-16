@@ -4,9 +4,10 @@ Built for, and tested against, the Itron Gen5 Riva meters Xcel Energy
 deploys with local "Launchpad" access, but nothing here is Xcel-specific.
 """
 
-from .client import REDACT_KEYS, Meter, MeterSnapshot, PeerInfo
+from .client import REDACT_KEYS, TIME_ERROR_KEY, Meter, MeterSnapshot, PeerInfo
 from .dnssd import SERVICE_TYPE, Advertisement, is_valid_sfdi, parse_advertisement
 from .exceptions import (
+    AuthReason,
     InvalidIdentity,
     MeterAuthError,
     MeterBusy,
@@ -46,7 +47,7 @@ from .models import (
     hourly_energy,
     manufacturer_name,
 )
-from .profile import Channel, Direction, MeterInfo, MeterProfile, Quantity, Statistic
+from .profile import KEY_SCHEME, PROFILE_VERSION, Channel, Direction, MeterInfo, MeterProfile, Quantity, Statistic
 from .transport import (
     PeerCertificate,
     Timeouts,
@@ -59,10 +60,14 @@ from .transport import (
 __version__ = "0.4.0"
 
 __all__ = [
+    "KEY_SCHEME",
+    "PROFILE_VERSION",
     "REDACT_KEYS",
     "SERVICE_TYPE",
+    "TIME_ERROR_KEY",
     "AcceptedReadings",
     "Advertisement",
+    "AuthReason",
     "Channel",
     "DeviceInformation",
     "Direction",

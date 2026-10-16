@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 import ssl
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .exceptions import MeterAuthError, MeterError, MeterNotFound, MeterProtocolError, ProfileError
+from .exceptions import AuthReason, MeterAuthError, MeterError, MeterNotFound, MeterProtocolError, ProfileError
 from .identity import Identity
 from .models import (
     DeviceInformation,
@@ -50,6 +51,10 @@ _LOGGER = logging.getLogger(__name__)
 # Keys in this library's to_dict() output (and in Identity.to_dict()) that
 # identify the meter, its owner's premises or a secret. For Home Assistant
 # diagnostics: async_redact_data(data, REDACT_KEYS).
+# The key under which read(partial=True) records a failed clock read in
+# MeterSnapshot.errors (no channel key contains a colon).
+TIME_ERROR_KEY = ":time"
+
 REDACT_KEYS = frozenset(
     {
         "cert_pem",
@@ -76,7 +81,8 @@ class MeterSnapshot:
     # ToU registers by channel key. Tier 0 is the total.
     tou: dict[str, TouRegister] = field(default_factory=dict)
     meter_time: MeterTime | None = None
-    # read(partial=True) only: channels that failed, and why. A
+    # read(partial=True) only: channels that failed, and why (a failed clock
+    # read under TIME_ERROR_KEY). A
     # MeterNotFound here means the profile is stale (rediscover).
     errors: dict[str, MeterError] = field(default_factory=dict)
 
@@ -107,7 +113,7 @@ class MeterSnapshot:
             values={k: Measurement.from_dict(m) for k, m in d.get("values", {}).items()},
             tou={k: TouRegister.from_dict(r) for k, r in d.get("tou", {}).items()},
             meter_time=MeterTime.from_dict(d["meter_time"]) if d.get("meter_time") else None,
-            errors={k: MeterProtocolError(str(m)) for k, m in d.get("errors", {}).items()},
+            errors={k: _replayed_error(str(m)) for k, m in d.get("errors", {}).items()},
         )
 
 
@@ -117,14 +123,16 @@ class PeerInfo:
 
     certificate: PeerCertificate  # .lfdi / .sfdi identify the meter
     client_accepted: bool  # the handshake completed with our certificate
-    auth_reason: str | None = None  # MeterAuthError.reason when it did not
+    auth_reason: AuthReason | None = None  # MeterAuthError.reason when it did not
 
     @property
     def lfdi(self) -> str:
+        """The device's LFDI, from its TLS certificate."""
         return self.certificate.lfdi
 
     @property
     def sfdi(self) -> str:
+        """The device's SFDI, from its TLS certificate (what mDNS advertises)."""
         return self.certificate.sfdi
 
 
@@ -133,7 +141,8 @@ class Meter:
 
     Every public coroutine runs as one batch on one connection, and the
     instance never opens two connections at once. Share a single ``Meter``
-    per physical meter.
+    per physical meter. The address is fixed: when the meter moves, create a
+    new ``Meter``.
 
     The meter is identified by its LFDI, not its address: every connection
     checks the meter's certificate against ``expected_lfdi`` before sending a
@@ -155,12 +164,12 @@ class Meter:
         expected_lfdi: str | None = None,
         dcap_path: str = "/dcap",
     ) -> None:
-        self.host = host
-        self.port = port
+        self._host = host
+        self._port = port
         # Where discovery starts: the DNS-SD TXT record ``dcap`` when the
         # meter was found by mDNS.
-        self.dcap_path = dcap_path
-        self.transport = MeterTransport(
+        self._dcap_path = dcap_path
+        self._transport = MeterTransport(
             host,
             port,
             ssl_context,
@@ -199,18 +208,56 @@ class Meter:
         )
 
     @classmethod
-    async def from_files(cls, host: str, cert_path: str, key_path: str, port: int = 8081, **kwargs: object) -> Meter:
-        """Build the TLS context off the event loop (it reads files)."""
+    async def from_files(
+        cls,
+        host: str,
+        cert_path: str,
+        key_path: str,
+        port: int = 8081,
+        *,
+        timeouts: Timeouts | None = None,
+        expected_lfdi: str | None = None,
+        dcap_path: str = "/dcap",
+        min_connect_interval: float = 2.0,
+        request_spacing: float = 0.25,
+    ) -> Meter:
+        """A Meter using the certificate and key in these PEM files. Builds the
+        TLS context off the event loop (it reads files)."""
         ctx = await asyncio.to_thread(build_ssl_context, cert_path, key_path)
-        return cls(host, ctx, port, **kwargs)  # type: ignore[arg-type]
+        return cls(
+            host,
+            ctx,
+            port,
+            timeouts=timeouts,
+            min_connect_interval=min_connect_interval,
+            request_spacing=request_spacing,
+            expected_lfdi=expected_lfdi,
+            dcap_path=dcap_path,
+        )
+
+    @property
+    def host(self) -> str:
+        """The address this Meter talks to."""
+        return self._host
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    @property
+    def dcap_path(self) -> str:
+        """Where discovery starts (the DNS-SD TXT ``dcap`` when found by mDNS)."""
+        return self._dcap_path
 
     @property
     def stats(self) -> TransportStats:
-        return self.transport.stats
+        """Connection counters, e.g. for diagnostics."""
+        return self._transport.stats
 
     @property
     def expected_lfdi(self) -> str | None:
-        return self.transport.expected_lfdi
+        """The meter's LFDI this Meter insists on, once known."""
+        return self._transport.expected_lfdi
 
     async def probe_tls(self) -> PeerInfo:
         """Who is at this address, and does it take our certificate?
@@ -225,12 +272,12 @@ class Meter:
         ``MeterProtocolError`` if the device sent no certificate.
         """
         try:
-            async with self.transport.batch(verify_identity=False) as b:
+            async with self._transport.batch(verify_identity=False) as b:
                 peer = await b.connect()
         except MeterAuthError as err:
-            if self.transport.peer is None:
+            if self._transport.peer is None:
                 raise
-            return PeerInfo(self.transport.peer, client_accepted=False, auth_reason=err.reason)
+            return PeerInfo(self._transport.peer, client_accepted=False, auth_reason=err.reason)
         if peer is None:
             raise MeterProtocolError(f"{self.host}:{self.port} presented no certificate")
         return PeerInfo(peer, client_accepted=True)
@@ -239,15 +286,18 @@ class Meter:
         """Who the meter is, once our certificate is registered: 1-3 GETs on
         one connection (DeviceCapability, SelfDevice, DeviceInformation).
         Checks ``expected_lfdi`` like every call; does not pin."""
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             return await read_meter_info(b, self.host, self.port, dcap_path=self.dcap_path)
 
     async def discover(self, *, dcap_path: str | None = None) -> MeterProfile:
         """Walk the resource tree (~30 GETs, one connection), starting at
         ``dcap_path`` (default: the Meter's). Pins the meter
         (``expected_lfdi``) if nothing was pinned yet."""
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             peer = await b.connect()
+            if peer is not None and self._transport.expected_lfdi is None:
+                # Pin now, so a reconnect mid-walk cannot mix in another device.
+                self._transport.expected_lfdi = peer.lfdi
             profile = await discover(b, self.host, self.port, dcap_path=dcap_path or self.dcap_path)
         if peer is None:
             return profile
@@ -258,8 +308,6 @@ class Meter:
                 profile.meter_lfdi,
                 peer.lfdi,
             )
-        if self.transport.expected_lfdi is None:
-            self.transport.expected_lfdi = peer.lfdi
         return dataclasses.replace(profile, certificate_lfdi=peer.lfdi)
 
     def _pin(self, profile: MeterProfile) -> None:
@@ -268,10 +316,12 @@ class Meter:
         pinned = profile.certificate_lfdi.upper() if profile.certificate_lfdi else None
         if pinned is None:
             return
-        if self.transport.expected_lfdi is None:
-            self.transport.expected_lfdi = pinned
-        elif self.transport.expected_lfdi != pinned:
-            raise ProfileError(f"profile is from meter {pinned}, but this Meter expects {self.transport.expected_lfdi}")
+        if self._transport.expected_lfdi is None:
+            self._transport.expected_lfdi = pinned
+        elif self._transport.expected_lfdi != pinned:
+            raise ProfileError(
+                f"profile is from meter {pinned}, but this Meter expects {self._transport.expected_lfdi}"
+            )
 
     async def read(
         self,
@@ -286,20 +336,33 @@ class Meter:
         Interval channels are skipped; use :meth:`read_latest_intervals`.
         Raises ``MeterNotFound`` if a profiled path vanished (rediscover).
 
+        ``include_time``: also read the meter's clock (``snapshot.meter_time``,
+        ``snapshot.clock_skew``). It is read first, and ``fetched_at`` is the
+        moment it answered.
+
         ``partial``: a channel the meter answers with an error or something
         unparsable (``MeterProtocolError``, incl. ``MeterNotFound``) is left
         out and recorded in ``snapshot.errors`` instead of failing the whole
-        batch. Connection, timeout, busy and authentication errors still
-        raise: they concern the meter, not a channel.
+        batch; so is a failed clock read, under :data:`TIME_ERROR_KEY`.
+        Connection, timeout, busy and authentication errors still raise: they
+        concern the meter, not a channel.
         """
         self._pin(profile)
         values: dict[str, Measurement] = {}
         tou: dict[str, TouRegister] = {}
         errors: dict[str, MeterError] = {}
         meter_time = None
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             # Taken once the lock is ours, not while queued behind another batch.
             fetched_at = datetime.now(UTC)
+            if include_time and profile.time_href:
+                try:
+                    meter_time = MeterTime.from_xml(parse_xml(await b.get(profile.time_href)))
+                except MeterProtocolError as err:
+                    if not partial:
+                        raise
+                    errors[TIME_ERROR_KEY] = err
+                fetched_at = datetime.now(UTC)
             for ch in channels:
                 try:
                     if ch.statistic == Statistic.TOU_SUMMATION and ch.tou_reading_list_href:
@@ -311,9 +374,6 @@ class Meter:
                     if not partial:
                         raise
                     errors[ch.key] = err
-            if include_time and profile.time_href:
-                meter_time = MeterTime.from_xml(parse_xml(await b.get(profile.time_href)))
-                fetched_at = datetime.now(UTC)
         return MeterSnapshot(fetched_at=fetched_at, values=values, tou=tou, meter_time=meter_time, errors=errors)
 
     # -- interval data -----------------------------------------------------------
@@ -329,17 +389,15 @@ class Meter:
         first). Two sets, so the last interval before a set boundary
         (11:45-12:00, 23:45-00:00 UTC) is not lost while the new set is empty."""
         _require_interval(channel)
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             newest = await _newest_sets(b, channel.reading_set_list_href, sets, self.host, self.port)
             return await _read_sets(b, channel, newest, complete_only, self.host, self.port)
 
     async def list_interval_sets(self, channel: Channel) -> list[ReadingSetInfo]:
         """Every stored ReadingSet of an interval channel, newest first."""
-        href = _require_interval(channel)
-        async with self.transport.batch() as b:
-            _, elems = await get_list(b, href, "ReadingSet")
-        sets = [_resolve_set(href, ReadingSetInfo.from_xml(e), self.host, self.port) for e in elems]
-        return sorted(sets, key=_start, reverse=True)
+        _require_interval(channel)
+        async with self._transport.batch() as b:
+            return await _list_sets(b, channel, self.host, self.port)
 
     async def read_interval_sets(
         self, channel: Channel, sets: Iterable[ReadingSetInfo], *, complete_only: bool = True
@@ -349,7 +407,7 @@ class Meter:
         other readers get the meter in between. A set that rolled off the
         meter meanwhile is skipped."""
         _require_interval(channel)
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             return await _read_sets(b, channel, list(sets), complete_only, self.host, self.port)
 
     async def read_intervals_since(
@@ -358,13 +416,15 @@ class Meter:
         """Completed intervals ending after ``since`` (an aware datetime), oldest first."""
         if since.tzinfo is None:
             raise ValueError("since must be timezone-aware (the meter speaks UTC)")
-        wanted = [
-            rs
-            for rs in await self.list_interval_sets(channel)
-            # A set of unknown length might reach past ``since``: keep it.
-            if rs.start is not None and (rs.duration is None or rs.start + timedelta(seconds=rs.duration) > since)
-        ]
-        values = await self.read_interval_sets(channel, wanted, complete_only=complete_only)
+        _require_interval(channel)
+        async with self._transport.batch() as b:
+            wanted = [
+                rs
+                for rs in await _list_sets(b, channel, self.host, self.port)
+                # A set of unknown length might reach past ``since``: keep it.
+                if rs.start is not None and (rs.duration is None or rs.start + timedelta(seconds=rs.duration) > since)
+            ]
+            values = await _read_sets(b, channel, wanted, complete_only, self.host, self.port)
         return [v for v in values if v.end > since]
 
     async def read_interval_history(
@@ -372,22 +432,28 @@ class Meter:
     ) -> list[IntervalValue]:
         """Every stored interval (oldest first), or the newest ``max_sets``
         sets. Expensive (~2 GETs per set, 60 sets on an Itron agent) and holds
-        the meter for the whole walk; prefer list/read_interval_sets in chunks."""
-        sets = await self.list_interval_sets(channel)
-        return await self.read_interval_sets(channel, sets[:max_sets], complete_only=complete_only)
+        the meter for the whole walk, as one batch; prefer list/read_interval_sets
+        in chunks."""
+        _require_interval(channel)
+        async with self._transport.batch() as b:
+            sets = await _list_sets(b, channel, self.host, self.port)
+            return await _read_sets(b, channel, sets[:max_sets], complete_only, self.host, self.port)
 
     async def device_information(self, profile: MeterProfile) -> DeviceInformation | None:
+        """The meter's DeviceInformation (manufacturer, model, versions), or
+        None if it links none."""
         self._pin(profile)
         if not profile.device_information_href:
             return None
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             return DeviceInformation.from_xml(parse_xml(await b.get(profile.device_information_href)))
 
     async def meter_time(self, profile: MeterProfile) -> MeterTime:
+        """The meter's clock. Raises ``MeterProtocolError`` if it has none."""
         self._pin(profile)
         if not profile.time_href:
             raise MeterProtocolError("meter advertises no TimeLink")
-        async with self.transport.batch() as b:
+        async with self._transport.batch() as b:
             return MeterTime.from_xml(parse_xml(await b.get(profile.time_href)))
 
 
@@ -421,6 +487,23 @@ async def _read_tou(b: Batch, ch: Channel) -> TouRegister:
         if r.tou_tier is not None:
             tiers[r.tou_tier] = Measurement.of(r, ch.reading_type)
     return TouRegister(tiers)
+
+
+async def _list_sets(b: Batch, channel: Channel, host: str, port: int) -> list[ReadingSetInfo]:
+    href = _require_interval(channel)
+    _, elems = await get_list(b, href, "ReadingSet")
+    sets = [_resolve_set(href, ReadingSetInfo.from_xml(e), host, port) for e in elems]
+    return sorted(sets, key=_start, reverse=True)
+
+
+def _replayed_error(text: str) -> MeterError:
+    """An error recorded by :meth:`MeterSnapshot.to_dict`, as close to its
+    original kind as the text allows (a replayed fixture keeps "rediscover")."""
+    name, _, message = text.partition(": ")
+    if name == "MeterNotFound":
+        m = re.fullmatch(r"GET (\S+) -> HTTP (\d{3})\b.*", message)
+        return MeterNotFound(m[1], int(m[2])) if m else MeterNotFound(message, 404)
+    return MeterProtocolError(text)
 
 
 def _resolve_set(base: str, rs: ReadingSetInfo, host: str, port: int) -> ReadingSetInfo:
@@ -470,4 +553,4 @@ async def _read_sets(
     return out
 
 
-__all__ = ["REDACT_KEYS", "Meter", "MeterSnapshot", "PeerInfo"]
+__all__ = ["REDACT_KEYS", "TIME_ERROR_KEY", "Meter", "MeterSnapshot", "PeerInfo"]

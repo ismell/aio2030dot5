@@ -99,7 +99,7 @@ def test_tls_context_from_pem_leaves_no_files(
     ctx = build_ssl_context_from_pem(ident.cert_pem, ident.key_pem)
     assert list(tmp_path.iterdir()) == []
     meter = Meter("127.0.0.1", ctx, fake_meter.port, timeouts=FAST, min_connect_interval=0)
-    assert asyncio.run(meter.transport.get("/dcap"))
+    assert asyncio.run(meter._transport.get("/dcap"))
 
 
 async def test_meter_create_from_an_identity(pki: Pki, fake_meter: FakeMeter) -> None:
@@ -137,16 +137,16 @@ async def test_a_call_past_its_deadline_is_a_meter_timeout(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=SlowTree()) as fm:
         meter = make_meter(pki, fm.port, timeouts=Timeouts(2, 2, 2, batch=0.2))
         with pytest.raises(MeterTimeout):
-            await meter.transport.get("/tm?slow=1")
+            await meter._transport.get("/tm?slow=1")
 
 
 async def test_waiting_for_the_lock_does_not_count_against_the_deadline(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=SlowTree()) as fm:
         slow = make_meter(pki, fm.port)
         quick = make_meter(pki, fm.port, timeouts=Timeouts(2, 2, 2, batch=0.4))
-        backfill = asyncio.create_task(slow.transport.get("/tm?slow=1"))  # holds the meter ~0.5 s
+        backfill = asyncio.create_task(slow._transport.get("/tm?slow=1"))  # holds the meter ~0.5 s
         await asyncio.sleep(0.05)
-        assert await quick.transport.get("/dcap")  # queued ~0.5 s, then quick
+        assert await quick._transport.get("/dcap")  # queued ~0.5 s, then quick
         await backfill
 
 

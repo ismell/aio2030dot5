@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .exceptions import (
+    AuthReason,
     InvalidIdentity,
     MeterAuthError,
     MeterBusy,
@@ -557,7 +558,7 @@ class _EmptyResponse(MeterConnectionError):
 
 
 # TLS alert (as OpenSSL names it in the reason) -> MeterAuthError.reason
-_AUTH_ALERTS = {
+_AUTH_ALERTS: dict[str, AuthReason] = {
     "BAD_CERTIFICATE": "certificate_rejected",
     "CERTIFICATE_UNKNOWN": "certificate_rejected",
     "UNKNOWN_CA": "certificate_rejected",
@@ -875,7 +876,8 @@ class Batch:
             raise MeterNotFound(path, resp.status, resp.reason)
         if resp.status in (401, 403):
             raise MeterAuthError(
-                f"GET {path} -> HTTP {resp.status} {resp.reason}".rstrip(), reason=f"http_{resp.status}"
+                f"GET {path} -> HTTP {resp.status} {resp.reason}".rstrip(),
+                reason="http_401" if resp.status == 401 else "http_403",
             )
         if resp.status in (429, 503):
             raise MeterBusy(f"GET {path} -> HTTP {resp.status} {resp.reason}".rstrip())

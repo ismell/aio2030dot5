@@ -47,7 +47,7 @@ async def test_cancelled_get_never_desyncs_the_batch(pki: Pki, monkeypatch: pyte
     monkeypatch.setattr(T._TlsConnection, "open", spy)
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=SlowTree()) as fm:
         meter = make_meter(pki, fm.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             with pytest.raises(TimeoutError):
                 async with asyncio.timeout(0.2):  # the caller's own deadline
                     await b.get("/dcap?slow=1")
@@ -59,7 +59,7 @@ async def test_cancelled_get_never_desyncs_the_batch(pki: Pki, monkeypatch: pyte
 async def test_concurrent_use_of_one_batch_is_refused(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, tree=SlowTree()) as fm:
         meter = make_meter(pki, fm.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             results = await asyncio.gather(b.get("/dcap?slow=1"), b.get("/tm"), return_exceptions=True)
         # gather() runs each in its own task: a Batch belongs to the task that
         # opened it, so neither may connect beside the lock holder.
@@ -70,7 +70,7 @@ async def test_concurrent_use_of_one_batch_is_refused(pki: Pki) -> None:
 async def test_batch_is_dead_after_its_block(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert) as fm:
         meter = make_meter(pki, fm.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             pass
         with pytest.raises(RuntimeError):
             await b.get("/dcap")
@@ -85,7 +85,7 @@ async def test_reset_during_handshake_is_a_connection_error(pki: Pki) -> None:
     with Server(handler) as srv:
         meter = make_meter(pki, srv.port)
         with pytest.raises(MeterConnectionError):
-            await meter.transport.get("/dcap")
+            await meter._transport.get("/dcap")
 
 
 @pytest.mark.parametrize("case", ["unregistered", "expired"])
@@ -125,9 +125,9 @@ async def test_rejected_certificate_is_an_auth_error(pki: Pki, tmp_path: Path, c
 
     with Server(handler) as srv:
         meter = make_meter(pki, srv.port)
-        meter.transport._ctx = T.build_ssl_context(cert, key)
+        meter._transport._ctx = T.build_ssl_context(cert, key)
         with pytest.raises(MeterAuthError):
-            await meter.transport.get("/dcap")
+            await meter._transport.get("/dcap")
 
 
 async def test_reset_of_a_reused_connection_reconnects(pki: Pki) -> None:
@@ -149,7 +149,7 @@ async def test_reset_of_a_reused_connection_reconnects(pki: Pki) -> None:
 
     with Server(handler) as srv:
         meter = make_meter(pki, srv.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             assert await b.get("/a") == b"ok"
             await asyncio.sleep(0.3)
             assert await b.get("/b") == b"ok"
@@ -160,7 +160,7 @@ async def test_idle_connection_is_replaced_before_the_meter_drops_it(pki: Pki, m
     monkeypatch.setattr(T, "REUSE_IDLE_LIMIT", 0.2)
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert) as fm:
         meter = make_meter(pki, fm.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             await b.get("/dcap")
             await asyncio.sleep(0.3)
             await b.get("/tm")
@@ -179,7 +179,7 @@ async def test_bodyless_status_does_not_wait_for_eof(pki: Pki) -> None:
 
     with Server(handler) as srv:
         meter = make_meter(pki, srv.port, timeouts=Timeouts(1, 1, 1))
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             async with asyncio.timeout(0.8):
                 resp = await b.request("/x")
         assert resp.status == 204 and resp.body == b""
@@ -198,7 +198,7 @@ async def test_truncated_chunked_trailer_is_a_connection_error(pki: Pki) -> None
     with Server(handler) as srv:
         meter = make_meter(pki, srv.port)
         with pytest.raises(MeterConnectionError):
-            await meter.transport.get("/x")
+            await meter._transport.get("/x")
 
 
 @pytest.mark.parametrize("href", ["/upt/é", "upt/1", "http://evil.example/x", "/a\r\nX-Injected: 1", "/a b"])
@@ -206,7 +206,7 @@ async def test_bad_hrefs_are_refused_before_any_connection(pki: Pki, href: str) 
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert) as fm:
         meter = make_meter(pki, fm.port)
         with pytest.raises(MeterProtocolError):
-            await meter.transport.get(href)
+            await meter._transport.get(href)
         assert fm.log.connections == 0
 
 
@@ -228,7 +228,7 @@ async def test_cancel_during_close_still_releases_the_socket(pki: Pki, monkeypat
             await asyncio.sleep(0.5)  # a meter that stopped reading
 
         async def work() -> None:
-            async with meter.transport.batch() as b:
+            async with meter._transport.batch() as b:
                 await b.get("/dcap")
                 monkeypatch.setattr(T._TlsConnection, "_flush", slow_flush)
 
@@ -238,7 +238,7 @@ async def test_cancel_during_close_still_releases_the_socket(pki: Pki, monkeypat
         with pytest.raises(asyncio.CancelledError):
             await task
         assert conns[0]._writer.is_closing()
-        assert not meter.transport._lock.locked()
+        assert not meter._transport._lock.locked()
 
 
 async def test_close_notify_marks_eof(pki: Pki) -> None:
@@ -253,7 +253,7 @@ async def test_close_notify_marks_eof(pki: Pki) -> None:
 
     with Server(handler) as srv:
         meter = make_meter(pki, srv.port)
-        async with meter.transport.batch() as b:
+        async with meter._transport.batch() as b:
             resp = await b.request("/x")
         assert resp.body == b"body-to-eof" and not resp.keep_alive
 

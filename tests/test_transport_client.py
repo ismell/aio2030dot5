@@ -144,7 +144,7 @@ async def test_server_without_keep_alive(pki: Pki) -> None:
 async def test_not_found_is_distinct(pki: Pki, fake_meter: FakeMeter) -> None:
     meter = make_meter(pki, fake_meter.port)
     with pytest.raises(MeterNotFound) as exc:
-        await meter.transport.get("/tp")
+        await meter._transport.get("/tp")
     assert exc.value.status == 404
     assert meter.stats.failures == 1
 
@@ -167,14 +167,14 @@ async def test_connection_refused() -> None:
 
     meter = Meter("127.0.0.1", transport_mod.ssl.create_default_context(), port, timeouts=FAST)
     with pytest.raises(MeterConnectionError):
-        await meter.transport.get("/dcap")
+        await meter._transport.get("/dcap")
 
 
 async def test_handshake_timeout(pki: Pki) -> None:
     with FakeMeter(pki.server_cert, pki.server_key, pki.client_cert, blackhole=True) as fm:
         meter = make_meter(pki, fm.port, timeouts=transport_mod.Timeouts(1.0, 0.5, 0.5))
         with pytest.raises(MeterTimeout):
-            await meter.transport.get("/dcap")
+            await meter._transport.get("/dcap")
 
 
 async def test_bad_signature_is_retried_once(pki: Pki, fake_meter: FakeMeter, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,7 +189,7 @@ async def test_bad_signature_is_retried_once(pki: Pki, fake_meter: FakeMeter, mo
 
     monkeypatch.setattr(transport_mod._TlsConnection, "open", flaky_open)
     meter = make_meter(pki, fake_meter.port)
-    assert b"DeviceCapability" in await meter.transport.get("/dcap")
+    assert b"DeviceCapability" in await meter._transport.get("/dcap")
     assert meter.stats.bad_signature_retries == 1 and calls["n"] == 2
 
 
@@ -200,5 +200,5 @@ async def test_bad_signature_twice_fails(pki: Pki, fake_meter: FakeMeter, monkey
     monkeypatch.setattr(transport_mod._TlsConnection, "open", always_bad)
     meter = make_meter(pki, fake_meter.port)
     with pytest.raises(MeterConnectionError):
-        await meter.transport.get("/dcap")
+        await meter._transport.get("/dcap")
     assert meter.stats.bad_signature_retries == 1
