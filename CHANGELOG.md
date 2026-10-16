@@ -47,6 +47,8 @@ Changes since the last pre-release (0.3.3):
   zeroconf and Home Assistant examples, how the meter is authenticated (LFDI pinning, trust on first use), the
   provenance of the library and its authorship.
 - Packaging: authors and project URLs, a `dev` dependency group (`uv run pytest`), NOTICE and SECURITY.md.
+- CI on Python 3.12-3.14 plus the lowest allowed dependency versions; releases from `v*` tags run the full CI and
+  publish through PyPI trusted publishing; a TestPyPI dry run publishes `<version>.devN`.
 
 ## Pre-releases
 

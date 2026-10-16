@@ -1,8 +1,9 @@
 name: Release
 
-# Publishes to PyPI with trusted publishing (no API token) when a v* tag is
-# pushed; the tag must match the package version. Run it by hand
-# (workflow_dispatch) to publish the current commit to TestPyPI instead.
+# On a v* tag: the full CI, a check that the tag matches the package version,
+# then a build published to PyPI with trusted publishing (no API token).
+# Run by hand (workflow_dispatch, from main) to publish a dry run to TestPyPI as
+# <version>.dev<run number>, which never uses up the real version number.
 on:
   push:
     tags: ["v*"]
@@ -11,20 +12,35 @@ on:
 permissions:
   contents: read
 
+env:
+  UV_VERSION: "0.11.19"
+
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-      - run: uv run --locked pytest -q
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false # nothing restored into a publishing build
       - name: The tag matches the version
         if: github.event_name == 'push'
         run: |
           version=$(uv run --locked python -c "import aio2030dot5; print(aio2030dot5.__version__)")
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != version $version"; exit 1; }
+      - name: A dry run gets its own dev version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          test "$GITHUB_REF_NAME" = main || { echo "dry runs are from main, not $GITHUB_REF_NAME"; exit 1; }
+          sed -i -E "s/^__version__ = \"([^\"]+)\"/__version__ = \"\1.dev${GITHUB_RUN_NUMBER}\"/" src/aio2030dot5/__init__.py
+          grep -n '^__version__' src/aio2030dot5/__init__.py
       - run: uv build
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
