@@ -32,6 +32,7 @@ from .identity import (
     lfdi_from_pem,
     load_identity,
     sfdi_from_lfdi,
+    short_lfdi,
 )
 from .models import (
     DeviceInformation,
@@ -122,4 +123,5 @@ __all__ = [
     "parse_advertisement",
     "questionable",
     "sfdi_from_lfdi",
+    "short_lfdi",
 ]

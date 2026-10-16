@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import inspect
 import itertools
 import re
 import xml.etree.ElementTree as ET
@@ -117,7 +118,7 @@ UNIT_SYMBOLS: dict[Uom, str] = {
 _DOCTYPE = ("<!DOCTYPE", "<!ENTITY")
 _DOCTYPE_BYTES = tuple(m.encode(enc) for m in _DOCTYPE for enc in ("ascii", "utf-16-le", "utf-16-be"))
 MAX_TEXT = 1024  # no 2030.5 text element is longer than a few dozen characters
-MAX_ELEMENTS = 100_000  # a full page of 255 Readings is a few thousand
+MAX_ELEMENTS = 100_000  # tags or attributes; a full page of 255 Readings has a few thousand
 
 
 def parse_xml(body: bytes | str) -> ET.Element:
@@ -126,8 +127,9 @@ def parse_xml(body: bytes | str) -> ET.Element:
     a capped response by orders of magnitude."""
     if any(m in body for m in (_DOCTYPE if isinstance(body, str) else _DOCTYPE_BYTES)):  # type: ignore[operator]
         raise MeterProtocolError("XML from meter has a document type declaration")
-    if body.count("<" if isinstance(body, str) else b"<") > MAX_ELEMENTS:  # type: ignore[arg-type]
-        raise MeterProtocolError("XML from meter has more elements than any 2030.5 resource")
+    lt, eq = ("<", "=") if isinstance(body, str) else (b"<", b"=")
+    if body.count(lt) > MAX_ELEMENTS or body.count(eq) > MAX_ELEMENTS:  # type: ignore[arg-type]
+        raise MeterProtocolError("XML from meter has more markup than any 2030.5 resource")
     try:
         return ET.fromstring(body)
     except (ET.ParseError, ValueError, LookupError) as err:
@@ -140,9 +142,12 @@ def restores[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
     whatever malformed data raises into ``ProfileError`` -- the one way every
     ``from_dict`` in this library fails (``Identity`` raises ``InvalidIdentity``)."""
 
+    signature = inspect.signature(fn)
+
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        data = args[1] if len(args) > 1 else next(iter(kwargs.values()), None)
+        bound = signature.bind(*args, **kwargs)  # a wrong call stays a TypeError: it is a bug, not bad data
+        data = list(bound.arguments.values())[1]
         owner = getattr(args[0], "__name__", "data") if args else "data"
         if not isinstance(data, Mapping):
             raise ProfileError(f"cannot restore {owner} from {type(data).__name__}")
@@ -196,14 +201,16 @@ def _number_text(elem: ET.Element, name: str) -> str | None:
     return t or None
 
 
+_INTEGER = re.compile(r"[+-]?[0-9]+")
+
+
 def int_or_none(elem: ET.Element, name: str) -> int | None:
     t = _number_text(elem, name)
     if t is None:
         return None
-    try:
-        return int(t)
-    except ValueError as err:
-        raise MeterProtocolError(f"<{name}> is not an integer: {short(t)}") from err
+    if not _INTEGER.fullmatch(t):  # xs:integer: no "1_000", no non-ASCII digits
+        raise MeterProtocolError(f"<{name}> is not an integer: {short(t)}")
+    return int(t)
 
 
 MAX_HREF = 1024  # no 2030.5 path comes close; an Itron agent's longest is ~25 characters
@@ -242,10 +249,9 @@ def int_attr(elem: ET.Element, name: str, default: int = 0) -> int:
     raw = elem.get(name)
     if raw is None:
         return default
-    try:
-        return int(raw)
-    except ValueError as err:
-        raise MeterProtocolError(f"attribute {name}={short(raw)} is not an integer") from err
+    if len(raw) > 40 or not _INTEGER.fullmatch(raw.strip()):
+        raise MeterProtocolError(f"attribute {name}={short(raw)} is not an integer")
+    return int(raw)
 
 
 _HEX = re.compile(r"[0-9A-Fa-f]+")
@@ -279,6 +285,16 @@ def int_in_range(elem: ET.Element, name: str, lo: int, hi: int) -> int | None:
     return value
 
 
+def _poll_rate(elem: ET.Element) -> int | None:
+    """A list's pollRate attribute (UInt32 seconds), or None."""
+    if not elem.get("pollRate"):
+        return None
+    rate = int_attr(elem, "pollRate")
+    if not 0 <= rate < UINT32:
+        raise MeterProtocolError(f"pollRate {rate} out of range")
+    return rate
+
+
 # -- resources ----------------------------------------------------------------
 
 
@@ -295,7 +311,7 @@ class ListPage:
         return cls(
             all=int_attr(elem, "all"),
             results=int_attr(elem, "results"),
-            poll_rate=int_attr(elem, "pollRate") if elem.get("pollRate") else None,
+            poll_rate=_poll_rate(elem),
         )
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import time
 
 import pytest
 
@@ -28,6 +27,7 @@ from .meter_server import FakeMeter
 NOW = 1_800_000_000.0
 HOUR = 3600.0
 DAY = 24 * HOUR
+QUARTER = 900.0  # a poll every 15 minutes: well inside the 30-minute gap that breaks a run
 LIFETIME = 50_000_000.0  # a 50 MWh lifetime register
 
 
@@ -111,12 +111,12 @@ def test_a_meter_answering_zero_for_a_while_is_not_a_reset() -> None:
 def test_a_drop_lasting_a_day_is_a_reset_and_the_old_series_can_return() -> None:
     guard = ReadingGuard()
     guard.register("r", LIFETIME, NOW)
-    results = _series(guard, [float(i) for i in range(26)], NOW, HOUR)
-    assert results[:23] == [None] * 23 and results[24] == 24.0  # adopted after 24 h
-    assert guard.resets["r"] == guard.rebases["r"] == NOW + 25 * HOUR
+    results = _series(guard, [float(i) for i in range(100)], NOW, QUARTER)
+    assert results[:96] == [None] * 96 and results[96] == 96.0  # adopted after 24 h
+    assert guard.resets["r"] == guard.rebases["r"] == NOW + 97 * QUARTER
     # The meter returns to its real register: back to the earlier series at once,
     # recorded as another rebase so a consumer starts a new cycle, not a 50 MWh step.
-    t = NOW + 27 * HOUR
+    t = NOW + 101 * QUARTER
     assert guard.register("r", LIFETIME + 100, t) == LIFETIME + 100
     assert guard.rebases["r"] == t and "r" not in guard.displaced
 
@@ -135,29 +135,39 @@ def test_a_confirmation_survives_restarts() -> None:
     guard = ReadingGuard()
     guard.register("r", LIFETIME, NOW)
     t = NOW
-    for _hour in range(25):  # a consumer restarting every hour while the meter reads ~0
-        t += HOUR
-        assert guard.register("r", t - NOW, t) is None or t - NOW >= DAY
+    for _ in range(96):  # a consumer restarting after every poll while the meter reads ~0
+        t += QUARTER
+        assert guard.register("r", (t - NOW) / 900, t) is None
         guard = ReadingGuard.from_dict(guard.to_dict())
-    t += HOUR
-    assert guard.register("r", t - NOW, t) == t - NOW  # adopted: the run kept its start
+    t += QUARTER
+    assert guard.register("r", (t - NOW) / 900, t) == 97.0  # adopted: the run kept its start
     assert "r" in guard.resets
+
+
+def test_a_gap_in_the_reads_starts_a_confirmation_over() -> None:
+    """Downtime is not observation: an hour without reads breaks the run."""
+    guard = ReadingGuard()
+    guard.register("r", LIFETIME, NOW)
+    before = _series(guard, [float(i) for i in range(48)], NOW, QUARTER)  # 12 h of reads
+    after = _series(guard, [float(i) for i in range(60, 120)], NOW + 49 * QUARTER + HOUR, QUARTER)
+    assert before == [None] * 48 and after == [None] * 60  # 12 h + 15 h, but never 24 h in one run
+    assert guard.resets == {}
 
 
 def test_a_lone_spike_does_not_restart_a_long_confirmation() -> None:
     guard = ReadingGuard()
     guard.register("r", LIFETIME, NOW)
-    values = [float(i) for i in range(30)]
-    values[20] = 9e12  # one absurd read, 20 hours in
-    results = _series(guard, values, NOW, HOUR)
-    assert results[25] is not None  # adopted after 24 h despite the spike
+    values = [float(i) for i in range(100)]
+    values[80] = 9e12  # one absurd read, 20 hours in
+    results = _series(guard, values, NOW, QUARTER)
+    assert results[80] is None and results[96] == 96.0  # adopted after 24 h despite the spike
 
 
 def test_an_inconsistent_run_starts_over() -> None:
     guard = ReadingGuard()
     guard.register("r", 1_000.0, 0.0)
     for i, spike in enumerate((9e9, 5e9, 9e9, 5e9, 9e9)):
-        assert guard.register("r", spike, HOUR * (i + 1)) is None
+        assert guard.register("r", spike, QUARTER * (i + 1)) is None
     assert guard.register("r", 1_010.0, 6 * HOUR) == 1_010.0
     assert guard.register("r", None, 7 * HOUR) is None
 
@@ -321,25 +331,40 @@ async def test_a_failed_tou_register_is_unknown_in_tou_not_values(pki: Pki, fake
     assert accepted.tou[key] == dict.fromkeys((0, *channel.tou_tiers))
 
 
-async def test_registers_are_judged_when_the_meter_took_them(pki: Pki, fake_meter: FakeMeter) -> None:
+async def test_the_meters_clock_never_widens_the_bound(pki: Pki, fake_meter: FakeMeter) -> None:
+    """A reading dated a year ahead is judged at the consumer's clock: a spike stays a spike."""
+    from datetime import UTC, datetime
+
     profile, snapshot = await _snapshot(pki, fake_meter)
     energy = _key(profile, statistic=Statistic.SUMMATION)
-    taken = snapshot.values[energy].start
-    assert taken is not None
+    total = snapshot.values[energy].value
+    assert total is not None
     guard = ReadingGuard()
-    guard.accept(snapshot, profile)
-    assert guard.registers[energy][1] == taken.timestamp()
-    undated = _with_value(snapshot, energy, start=None)
-    guard.accept(undated, profile)  # no start: the clock
-    assert abs(guard.registers[energy][1] - time.time()) < 60
+    guard.accept(snapshot, profile, NOW)
+    future = datetime(2100, 1, 1, tzinfo=UTC)
+    spike = _with_value(snapshot, energy, value=total + 4e8, start=future)
+    assert guard.accept(spike, profile, NOW + 60).values[energy] is None
+    assert guard.accept(snapshot, profile, NOW + 120).values[energy] == total  # the real register still flows
 
 
 def test_a_register_refreshed_hourly_is_not_a_spike() -> None:
     """ToU tiers on an Itron change about once an hour: polled every minute, the
     step after an hour of EV charging must still be plausible."""
     guard = ReadingGuard()
-    stamped = NOW
-    guard.register("tier", 1_000_000.0, stamped)
-    for _minute in range(1, 60):  # the same stale reading, stamped by the meter at NOW
-        assert guard.register("tier", 1_000_000.0, stamped) == 1_000_000.0
+    guard.register("tier", 1_000_000.0, NOW)
+    for minute in range(1, 67):  # the same stale value at every poll
+        assert guard.register("tier", 1_000_000.0, NOW + 60 * minute) == 1_000_000.0
     assert guard.register("tier", 1_007_500.0, NOW + 67 * 60) == 1_007_500.0  # 7.5 kWh in 67 min
+    assert guard.registers["tier"] == (1_007_500.0, NOW + 67 * 60)
+
+
+def test_malformed_saved_state_is_ignored_entry_by_entry() -> None:
+    state = {
+        "registers": {"ok": [1.0, 2.0], "dict": {"x": 1}, "short": "ab", "inf": [1, "inf"], "long": [1, 2, 3]},
+        "pending": {"ok": [1, 2, 3, 4, 0], "huge": [1, 2, 3, 1e400, 0], "strays": [1, 2, 3, 2, 9], "dict": {"a": 1}},
+        "rebases": {"ok": 5, "bool": True, "nan": "nan"},
+    }
+    guard = ReadingGuard.from_dict(state)
+    assert guard.registers == {"ok": (1.0, 2.0)}
+    assert guard.pending == ["ok"]
+    assert guard.rebases == {"ok": 5.0}

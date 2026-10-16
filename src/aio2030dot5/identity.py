@@ -62,6 +62,13 @@ def format_lfdi(lfdi: str) -> str:
     return "-".join(digits[i : i + 5] for i in range(0, 40, 5))
 
 
+def short_lfdi(lfdi: str | None) -> str:
+    """An LFDI for logs and messages: its last six hex digits. Users paste logs
+    into public issues; the suffix tells two certificates apart without
+    revealing the device (the SFDI comes from the LFDI's first digits)."""
+    return f"...{lfdi[-6:]}" if lfdi else "none"
+
+
 def canonical_sfdi(sfdi: str | int) -> str:
     """An SFDI in one lexical form. It is an integer (UInt40): agents may
     zero-pad it ("060044366894"), so compare canonical forms only."""
@@ -325,4 +332,5 @@ __all__ = [
     "lfdi_from_pem",
     "load_identity",
     "sfdi_from_lfdi",
+    "short_lfdi",
 ]

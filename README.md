@@ -158,11 +158,12 @@ if peer.client_accepted:
   `MeterNotFound` there means the profile is stale.
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
-  faster than the service allows, judged at the time the meter took each reading. A net register may move either
-  way at that rate. It adopts a new series only once it has lasted: an hour and 3 reads upward, a day and 12 reads
-  downward (a net register always uses the upward rule). `.rebases` holds the time of each register's latest
-  adoption and `.resets` that of its latest downward one, so a consumer can start a new accumulation cycle instead of
-  booking the step.
+  faster than the service allows since the register last changed (so a ToU tier the meter refreshes hourly may step
+  by an hour's worth). A net register may move either way at that rate. It adopts a new series only once it has
+  lasted: an hour and 3 reads upward, a day and 12 reads downward (a net register always uses the upward rule), with
+  no gap over 30 minutes in the reads. All times are your clock, never the meter's. `.rebases` holds the time of each
+  register's latest adoption and `.resets` that of its latest downward one, so a consumer can start a new
+  accumulation cycle instead of booking the step.
   `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with the meter's own "questionable"
   flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.to_dict()` and restore it with
   `ReadingGuard.from_dict(data)`.

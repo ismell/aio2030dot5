@@ -28,7 +28,7 @@ from .exceptions import (
     MeterProtocolError,
     ProfileError,
 )
-from .identity import Identity
+from .identity import Identity, short_lfdi
 from .models import (
     DeviceInformation,
     IntervalValue,
@@ -92,9 +92,9 @@ class MeterSnapshot:
     # ToU registers by channel key. Tier 0 is the total.
     tou: dict[str, TouRegister] = field(default_factory=dict)
     meter_time: MeterTime | None = None
-    # read(partial=True) only: channels that failed, and why (a failed clock
-    # read under TIME_ERROR_KEY). A
-    # MeterNotFound here means the profile is stale (rediscover).
+    # read(partial=True) only: the channels that failed, and why (a failed clock
+    # read under TIME_ERROR_KEY). A MeterNotFound here means the profile is stale:
+    # rediscover.
     errors: dict[str, MeterError] = field(default_factory=dict)
 
     @property
@@ -328,8 +328,8 @@ class Meter:
             _LOGGER.warning(
                 "%s: /sdev reports LFDI %s but its TLS certificate is %s; pinning the certificate",
                 self.host,
-                profile.meter_lfdi,
-                peer.lfdi,
+                short_lfdi(profile.meter_lfdi),
+                short_lfdi(peer.lfdi),
             )
         return dataclasses.replace(profile, certificate_lfdi=peer.lfdi)
 
@@ -344,7 +344,8 @@ class Meter:
             self._transport.expected_lfdi = pinned
         elif self._transport.expected_lfdi != pinned:
             raise ProfileError(
-                f"profile is from meter {pinned}, but this Meter expects {self._transport.expected_lfdi}"
+                f"profile is from meter LFDI {short_lfdi(pinned)}, "
+                f"but this Meter expects {short_lfdi(self._transport.expected_lfdi)}"
             )
 
     async def read(

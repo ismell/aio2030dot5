@@ -3,7 +3,8 @@ name: Release
 # On a v* tag: the full CI, a check that the tag matches the package version,
 # then a build published to PyPI with trusted publishing (no API token).
 # Run by hand (workflow_dispatch, from main) to publish a dry run to TestPyPI as
-# <version>.dev<run number>, which never uses up the real version number.
+# <version>.devN, which never uses up the real version number. The repository
+# settings this relies on are in RELEASING.md.
 on:
   push:
     tags: ["v*"]
@@ -51,8 +52,8 @@ jobs:
       - name: A dry run gets its own dev version
         if: github.event_name == 'workflow_dispatch'
         run: |
-          # Run number and attempt: a re-run after a partial upload gets a new version too.
-          dev="dev${GITHUB_RUN_NUMBER}${GITHUB_RUN_ATTEMPT}"
+          # Unique per run and attempt ("Re-run all jobs" builds a new version).
+          dev="dev$((GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
           sed -i -E "s/^__version__ = \"([^\"]+)\"/__version__ = \"\1.${dev}\"/" src/aio2030dot5/__init__.py
           grep -q "^__version__ = \".*\.${dev}\"$" src/aio2030dot5/__init__.py || { echo "version not stamped"; exit 1; }
       - run: uv build
@@ -94,3 +95,6 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
+          # Dev versions are disposable: "Re-run failed jobs" after a partial
+          # upload completes it. Never set for the real release above.
+          skip-existing: true

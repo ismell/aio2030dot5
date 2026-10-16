@@ -279,3 +279,61 @@ def test_exceptions_survive_copy_and_pickle() -> None:
         for again in (copy.copy(err), pickle.loads(pickle.dumps(err))):
             assert type(again) is type(err) and str(again) == str(err) and vars(again) == vars(err)
     assert "A" * 40 not in str(errors[0])  # the message shortens the LFDIs
+
+
+async def test_bytes_after_a_content_length_body_belong_to_the_next_response(pki: Pki) -> None:
+    sctx = server_ctx(pki)
+
+    def response(body: bytes) -> bytes:
+        return OK + b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+
+    def handler(raw):  # type: ignore[no-untyped-def]
+        tls = sctx.wrap_socket(raw, server_side=True)
+        read_request(tls)
+        tls.sendall(response(b"first") + response(b"second"))  # two responses in one write
+        read_request(tls)
+        tls.sendall(response(b"third"))  # what a client that lost "second" would read
+        time.sleep(0.3)
+
+    with Server(handler) as srv:
+        meter = make_meter(pki, srv.port)
+        async with meter._transport.batch() as b:
+            assert await b.get("/a") == b"first"
+            assert await b.get("/b") == b"second"
+
+
+@pytest.mark.parametrize("line", [b"\r\n", b";ext=1\r\n"])
+async def test_an_empty_chunk_size_is_not_the_last_chunk(pki: Pki, line: bytes) -> None:
+    with pytest.raises(MeterProtocolError):
+        await _get(pki, OK + b"Transfer-Encoding: chunked\r\n\r\n" + line + b"5\r\nhello\r\n0\r\n\r\n")
+
+
+def test_a_flood_of_attributes_is_refused() -> None:
+    from aio2030dot5.models import MAX_ELEMENTS
+
+    attrs = " ".join(f'a{i}="1"' for i in range(MAX_ELEMENTS + 1))
+    with pytest.raises(MeterProtocolError):
+        parse_xml(f"<R {NS} {attrs}/>")
+
+
+# Underscores, Arabic-Indic and fullwidth digits, and a hex prefix are not xs:integer.
+@pytest.mark.parametrize("number", ["1_000", "\u0665", "\uff15", "0x10"])
+def test_integers_are_plain_ascii_digits(number: str) -> None:
+    with pytest.raises(MeterProtocolError):
+        Reading.from_xml(parse_xml(f"<Reading {NS}><value>{number}</value></Reading>"))
+
+
+def test_messages_never_carry_a_whole_lfdi_or_its_sfdi() -> None:
+    from aio2030dot5 import MeterIdentityMismatch, sfdi_from_lfdi
+
+    expected, actual = "0123456789ABCDEF0123456789ABCDEF01234567", "FEDCBA9876543210FEDCBA9876543210FEDCBA98"
+    text = str(MeterIdentityMismatch("192.0.2.19", expected, actual))
+    for lfdi in (expected, actual):
+        assert lfdi not in text and sfdi_from_lfdi(lfdi) not in text and lfdi[-6:] in text
+
+
+def test_a_wrong_call_to_from_dict_is_not_bad_data() -> None:
+    from aio2030dot5 import Measurement
+
+    with pytest.raises(TypeError):
+        Measurement.from_dict()  # type: ignore[call-arg]

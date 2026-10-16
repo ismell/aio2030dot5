@@ -14,7 +14,17 @@ import os
 import sys
 from pathlib import Path
 
-from . import InvalidIdentity, Meter, MeterError, MeterNotFound, MeterProfile, ProfileError, Statistic, __version__
+from . import (
+    InvalidIdentity,
+    Meter,
+    MeterError,
+    MeterIdentityMismatch,
+    MeterNotFound,
+    MeterProfile,
+    ProfileError,
+    Statistic,
+    __version__,
+)
 from .identity import check_identity, format_lfdi, generate_identity
 
 
@@ -41,17 +51,18 @@ def _write_private(path: Path, text: str) -> None:
         f.write(text)
 
 
-async def _profile(meter: Meter, path: str | None, *, refresh: bool) -> MeterProfile:
+async def _profile(meter: Meter, path: str | None, *, refresh: bool) -> tuple[MeterProfile, bool]:
+    """The profile, and whether it came from the cache file."""
     if path and not refresh and Path(path).exists():
         try:
-            return MeterProfile.from_dict(json.loads(Path(path).read_text()))
+            return MeterProfile.from_dict(json.loads(Path(path).read_text())), True
         except (ValueError, ProfileError) as err:  # JSONDecodeError is a ValueError
             print(f"{path}: {err}; discovering again", file=sys.stderr)
     profile = await meter.discover()
     if path:
         # It names the meter (its LFDI, SFDI, serial number): keep it private.
         _write_private(Path(path), json.dumps(profile.to_dict(), indent=1))
-    return profile
+    return profile, False
 
 
 def _identity(args: argparse.Namespace) -> int:
@@ -66,6 +77,7 @@ def _identity(args: argparse.Namespace) -> int:
             _write_private(key, ident.key_pem)
         except OSError:
             cert.unlink(missing_ok=True)
+            key.unlink(missing_ok=True)  # a partly written key would block the next --generate
             raise
     check = check_identity(cert.read_bytes(), key.read_bytes())
     print(
@@ -87,19 +99,28 @@ async def _run(args: argparse.Namespace) -> int:
             raise _UsageError(f"{path}: no such file")
     meter = await Meter.from_files(args.host, args.cert, args.key, args.port)
     try:
-        profile = await _profile(meter, args.profile, refresh=args.cmd == "discover")
+        profile, cached = await _profile(meter, args.profile, refresh=args.cmd == "discover")
         if args.cmd == "discover":
             print(json.dumps(profile.to_dict(), indent=1))
             return 0
         try:
             return await _use(meter, profile, args)
-        except (MeterNotFound, ProfileError) as err:
-            if not args.profile:
+        except MeterNotFound as err:
+            if not cached:
                 raise
-            # A path the cached profile names is gone, or it is another meter's.
+            # The cached profile names a path this meter no longer has. The same
+            # meter answered (its pin held), so rediscover through it.
             print(f"{args.profile}: {err}; discovering again", file=sys.stderr)
+            profile, _ = await _profile(meter, args.profile, refresh=True)
+            return await _use(meter, profile, args)
+        except MeterIdentityMismatch as err:
+            if not cached:
+                raise
+            # The cache is another meter's (or the address moved): start afresh.
+            print(f"{args.profile} is from another meter ({err}); discovering again", file=sys.stderr)
             meter = await Meter.from_files(args.host, args.cert, args.key, args.port)
-            return await _use(meter, await _profile(meter, args.profile, refresh=True), args)
+            profile, _ = await _profile(meter, args.profile, refresh=True)
+            return await _use(meter, profile, args)
     except MeterError as err:
         print(f"error: {type(err).__name__}: {err}", file=sys.stderr)
         return 1

@@ -13,6 +13,7 @@ derived from what a channel *is* -- quantity, statistic, direction, phase
 
 from __future__ import annotations
 
+import copy
 import enum
 import hashlib
 import logging
@@ -455,11 +456,15 @@ async def get_list(
             return page, items
 
 
-def _identity(elem: Any) -> str | bytes:
+def _identity(elem: ET.Element) -> str | bytes:
     """What makes a list item the same item on another page: its href, or for
     an item without one (interval Readings), a digest of its content."""
     href = elem.get("href")
-    return href if href else hashlib.sha256(ET.tostring(elem)).digest()
+    if href:
+        return href
+    bare = copy.copy(elem)
+    bare.tail = None  # the whitespace after an item differs between pages
+    return hashlib.sha256(ET.tostring(bare)).digest()
 
 
 # -- keys -----------------------------------------------------------------------

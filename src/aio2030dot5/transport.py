@@ -59,6 +59,7 @@ _MAX_CHUNK_LINE_BYTES = 1024
 _MAX_TARGET = 2048  # a resolved href plus our paging query
 _COMPACT_AFTER = 256 * 1024
 _CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
+_HEX_DIGITS = re.compile(rb"[0-9A-Fa-f]+")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")
 
 
@@ -498,7 +499,7 @@ class _TlsConnection:
                 if not chunk:
                     raise MeterConnectionError("meter closed the connection mid-body")
                 body_buf += chunk
-            body, self._body_buffer = bytes(body_buf[:length]), bytes(body_buf[length:])
+            body, self._buffer = bytes(body_buf[:length]), bytes(body_buf[length:])
         else:
             # No framing: the body runs to EOF and the connection is spent.
             body_buf = bytearray(rest)
@@ -528,7 +529,9 @@ class _TlsConnection:
         while True:
             line_end = await self._fill_until(buf, b"\r\n", pos, _MAX_CHUNK_LINE_BYTES, "chunk size line")
             size_field = bytes(buf[pos:line_end]).split(b";", 1)[0].strip(b" \t")
-            size_field = size_field.lstrip(b"0") or b"0"  # 1*HEXDIG may be zero-padded
+            if not _HEX_DIGITS.fullmatch(size_field):  # 1*HEXDIG: never empty
+                raise MeterProtocolError(f"bad chunk size {short(size_field)}")
+            size_field = size_field.lstrip(b"0") or b"0"  # it may be zero-padded
             if not _CHUNK_SIZE.fullmatch(size_field):
                 raise MeterProtocolError(f"bad chunk size {short(size_field)}")
             size = int(size_field, 16)

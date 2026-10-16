@@ -104,3 +104,27 @@ async def test_a_cache_naming_a_vanished_path_is_rediscovered(
     profile.write_text(json.dumps(cached))
     assert await loop.run_in_executor(None, _run, ["read", *common]) == 0
     assert "/gone" not in profile.read_text()
+
+
+async def test_another_meters_cache_is_replaced(
+    pki: Pki, fake_meter: FakeMeter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real = Meter.from_files
+
+    async def fast(*args: Any, **kwargs: Any) -> Meter:
+        return await real(*args, **kwargs, min_connect_interval=0.0, request_spacing=0.0)
+
+    monkeypatch.setattr(Meter, "from_files", fast)
+    profile = tmp_path / "profile.json"
+    common = ["--host", "127.0.0.1", "--port", str(fake_meter.port)]
+    common += ["--cert", str(pki.client_cert), "--key", str(pki.client_key), "--profile", str(profile)]
+    loop = asyncio.get_running_loop()
+    assert await loop.run_in_executor(None, _run, ["discover", *common]) == 0
+    cached = json.loads(profile.read_text())
+    real_lfdi = cached["certificate_lfdi"]
+    cached["certificate_lfdi"] = "A" * 40  # discovered from some other meter
+    profile.write_text(json.dumps(cached))
+    capsys.readouterr()
+    assert await loop.run_in_executor(None, _run, ["read", *common]) == 0
+    assert "is from another meter" in capsys.readouterr().err
+    assert json.loads(profile.read_text())["certificate_lfdi"] == real_lfdi

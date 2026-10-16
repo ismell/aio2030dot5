@@ -73,14 +73,14 @@ class MeterIdentityMismatch(MeterError):
     def __init__(self, host: str, expected: str, actual: str | None) -> None:
         # The message shortens the LFDIs (logs get pasted into public issues);
         # the attributes keep them whole.
-        who = f"LFDI {actual[:10]}..." if actual else "a device that did not prove its identity"
-        super().__init__(f"{host} is not the expected meter: {who}, expected {expected[:10]}...")
+        who = f"LFDI ...{actual[-6:]}" if actual else "a device that did not prove its identity"
+        super().__init__(f"{host} is not the expected meter: {who}, expected LFDI ...{expected[-6:]}")
         self.host = host
         self.expected = expected
         self.actual = actual
 
-    def __reduce__(self) -> tuple[type, tuple[str, str, str | None]]:
-        return type(self), (self.host, self.expected, self.actual)
+    def __reduce__(self) -> tuple[type, tuple[str, str, str | None], dict[str, object]]:
+        return type(self), (self.host, self.expected, self.actual), self.__dict__
 
 
 class MeterAuthError(MeterError):
@@ -102,8 +102,8 @@ class MeterAuthError(MeterError):
         super().__init__(message)
         self.reason: AuthReason = reason
 
-    def __reduce__(self) -> tuple[type, tuple[str, AuthReason]]:
-        return type(self), (str(self), self.reason)
+    def __reduce__(self) -> tuple[type, tuple[str, AuthReason], dict[str, object]]:
+        return type(self), (str(self), self.reason), self.__dict__
 
 
 class MeterProtocolError(MeterError):
@@ -118,8 +118,8 @@ class InvalidIdentity(MeterError):
         super().__init__(message)
         self.problems = problems
 
-    def __reduce__(self) -> tuple[type, tuple[str, tuple[str, ...]]]:
-        return type(self), (str(self), self.problems)
+    def __reduce__(self) -> tuple[type, tuple[str, tuple[str, ...]], dict[str, object]]:
+        return type(self), (str(self), self.problems), self.__dict__
 
 
 class ProfileError(MeterError):
@@ -134,10 +134,10 @@ class MeterHttpError(MeterProtocolError):
         super().__init__(f"GET {path} -> HTTP {status} {reason}".rstrip())
         self.path = path
         self.status = status
-        self.reason = reason
+        self.reason_phrase = reason
 
-    def __reduce__(self) -> tuple[type, tuple[str, int, str]]:
-        return type(self), (self.path, self.status, self.reason)
+    def __reduce__(self) -> tuple[type, tuple[str, int, str], dict[str, object]]:
+        return type(self), (self.path, self.status, self.reason_phrase), self.__dict__
 
 
 class MeterNotFound(MeterHttpError):
