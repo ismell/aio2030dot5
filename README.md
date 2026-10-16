@@ -69,15 +69,15 @@ Python 3.12 or newer. The only required dependency is `cryptography`.
 from aio2030dot5 import Meter, Quantity, Statistic, Direction
 
 meter = await Meter.from_files("192.0.2.19", "cert.pem", "key.pem")
-profile = await meter.discover()            # ~30 GETs on ONE connection; cache profile.to_dict()
+profile = await meter.discover()  # ~30 GETs on ONE connection; cache profile.to_dict()
 
 snap = await meter.read(profile, profile.channels, include_time=True)
-snap.values["power"].value                  # W, signed (negative while exporting)
-snap.values["energy_summation_delivered"]   # Wh imported
+snap.values["power"].value  # W, signed (negative while exporting)
+snap.values["energy_summation_delivered"]  # Wh imported
 snap.tou["energy_tou_summation_delivered"]  # {tier: Measurement}; tier 0 is the total
 
 ch = profile.find(Quantity.ENERGY, Statistic.INTERVAL, Direction.DELIVERED)
-await meter.read_latest_intervals(ch)       # completed 15-minute intervals of the newest set
+await meter.read_latest_intervals(ch)  # completed 15-minute intervals of the newest set
 ```
 
 Without a fixed address (the `zeroconf` extra):
@@ -86,7 +86,7 @@ Without a fixed address (the `zeroconf` extra):
 from zeroconf.asyncio import AsyncZeroconf
 from aio2030dot5.locate import async_locate
 
-adv = await async_locate(AsyncZeroconf(), "123456789014")   # the meter's SFDI
+adv = await async_locate(AsyncZeroconf(), "123456789014")  # the meter's SFDI
 meter = Meter(adv.host, ctx, adv.port, expected_lfdi=lfdi)  # the connection proves it is that meter
 profile = await meter.discover(dcap_path=adv.dcap_path)
 ```
@@ -109,9 +109,9 @@ identity = await hass.async_add_executor_job(generate_identity)  # or load_ident
 entry_data = {"identity": identity.to_dict(), "sfdi": adv.sfdi}  # secret: redact with REDACT_KEYS
 
 meter = await Meter.create(host, Identity.from_dict(entry_data["identity"]), dcap_path=adv.dcap_path)
-peer = await meter.probe_tls()          # who is there, even before registration
+peer = await meter.probe_tls()  # who is there, even before registration
 if peer.client_accepted:
-    info = await meter.probe()          # 1-3 GETs: lFDI/sFDI, manufacturer, model, serial, versions
+    info = await meter.probe()  # 1-3 GETs: lFDI/sFDI, manufacturer, model, serial, versions
 ```
 
 - **`Timeouts(batch=…)`** is a per-call deadline. It starts once the meter's lock is held, so time spent queued behind
@@ -119,6 +119,8 @@ if peer.client_accepted:
 - **`TouRegister`** is a ToU register: a read-only `{tier: Measurement}` with `.total` and `.tiers`.
 - **`ReadingGuard`** is an optional plausibility filter. It drops power beyond ±50 kW, and register decreases or rises
   faster than the service allows. It rebases on consistent new series, and records register resets in `.resets`.
+  `guard.accept(snapshot, profile)` runs a whole snapshot through it, together with the meter's own "questionable"
+  flags and failed reads, and returns `AcceptedReadings(values, tou)`. Persist `guard.as_dict()` between restarts.
 - **`hourly_energy(intervals)`** sums 15-minute intervals into the hourly rows long-term statistics want.
 - **`MeterProfile`** also keeps what the meter says it is (`model`, `serial_number`, `hardware_version`), None where the
   meter leaves them empty, as Itron does.

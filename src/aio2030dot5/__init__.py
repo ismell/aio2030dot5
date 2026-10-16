@@ -19,7 +19,7 @@ from .exceptions import (
     MeterTimeout,
     ProfileError,
 )
-from .guard import ReadingGuard
+from .guard import AcceptedReadings, ReadingGuard, questionable
 from .identity import (
     Identity,
     IdentityCheck,
@@ -56,11 +56,12 @@ from .transport import (
     build_ssl_context_from_pem,
 )
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 
 __all__ = [
     "REDACT_KEYS",
     "SERVICE_TYPE",
+    "AcceptedReadings",
     "Advertisement",
     "Channel",
     "DeviceInformation",
@@ -112,5 +113,6 @@ __all__ = [
     "load_identity",
     "manufacturer_name",
     "parse_advertisement",
+    "questionable",
     "sfdi_from_lfdi",
 ]

@@ -10,6 +10,9 @@ good. :class:`ReadingGuard` is an optional filter for consumers:
   may grow no faster than ``max_power`` allows since the last accepted value
   (plus 1 kWh of slack).
 
+:meth:`ReadingGuard.accept` applies all of that to a whole :class:`MeterSnapshot`,
+together with the meter's own verdict (readings it flags questionable).
+
 A real change of baseline shows up as rejected reads that are consistent
 *with each other*. After ``confirm`` of them (``confirm_decrease`` when the
 new series is below the old one, so a meter answering 0 for a while is not
@@ -22,9 +25,39 @@ negative change.
 from __future__ import annotations
 
 import logging
-from typing import Any
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from .models import QualityFlags
+from .profile import Quantity, Statistic
+
+if TYPE_CHECKING:
+    from .client import MeterSnapshot
+    from .models import Measurement
+    from .profile import MeterProfile
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedReadings:
+    """What :meth:`ReadingGuard.accept` lets through from one snapshot.
+
+    ``values`` maps each channel the snapshot read (or failed to read) to its
+    value, or None where the read failed, the meter flagged the reading
+    questionable, or the guard found it implausible. ``tou`` maps each ToU
+    register to ``{tier: value}`` for tiers 1..n (tier 0, the total, is the
+    register's own channel), None on the same grounds.
+    """
+
+    values: dict[str, float | None] = field(default_factory=dict)
+    tou: dict[str, dict[int, float | None]] = field(default_factory=dict)
+
+
+def questionable(measurement: Measurement) -> bool:
+    """True if the meter itself flags the reading as questionable."""
+    return measurement.quality is not None and bool(measurement.quality & QualityFlags.QUESTIONABLE)
 
 
 class ReadingGuard:
@@ -42,6 +75,36 @@ class ReadingGuard:
         self.pending: dict[str, list[tuple[float, float]]] = {}
         self.rejected = 0
         self._rejecting: set[str] = set()  # keys in a run of rejections (logged once)
+
+    def accept(self, snapshot: MeterSnapshot, profile: MeterProfile, now: float | None = None) -> AcceptedReadings:
+        """Filter a whole snapshot (``now``: epoch seconds, default the clock).
+
+        Summation channels and ToU tiers go through :meth:`register` (keyed
+        ``"<key>_tier_<n>"`` for tiers), power channels through :meth:`power`;
+        other channels pass as read. Channels not in ``profile`` are skipped.
+        """
+        now = time.time() if now is None else now
+        values: dict[str, float | None] = dict.fromkeys(snapshot.errors)
+        for key, measurement in snapshot.values.items():
+            channel = profile.channel(key)
+            if channel is None:
+                continue
+            value = None if questionable(measurement) else measurement.value
+            if channel.statistic == Statistic.SUMMATION:
+                value = self.register(key, value, now)
+            elif channel.quantity == Quantity.POWER:
+                value = self.power(key, value)
+            values[key] = value
+        tou: dict[str, dict[int, float | None]] = {}
+        for key, register in snapshot.tou.items():
+            if profile.channel(key) is None:
+                continue
+            tou[key] = {
+                tier: self.register(f"{key}_tier_{tier}", None if questionable(m) else m.value, now)
+                for tier, m in register.items()
+                if tier > 0
+            }
+        return AcceptedReadings(values, tou)
 
     def power(self, key: str, value: float | None) -> float | None:
         """The power reading, or None if it is implausible."""

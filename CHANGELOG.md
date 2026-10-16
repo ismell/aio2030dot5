@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+- `ReadingGuard.accept(snapshot, profile, now=None)` filters a whole `MeterSnapshot`: readings the meter flags
+  questionable and reads that failed become None, summation channels and ToU tiers go through `register()`, power
+  through `power()`. It returns `AcceptedReadings(values, tou)`. Consumers no longer re-implement this policy.
+- `questionable(measurement)` exposes the meter's own verdict on a reading.
+- Packaging: authors and project URLs, a `dev` dependency group (`uv run pytest`), NOTICE and SECURITY.md.
+
 ## 0.3.3
 - `format_lfdi()` accepts any grouping, case and surrounding whitespace, and raises `ValueError` unless 40 hex
   digits remain, instead of grouping whatever it was given.
