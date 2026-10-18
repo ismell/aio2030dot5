@@ -3,7 +3,7 @@
 aio2030dot5 handles a client certificate and its private key, and talks TLS to a
 meter on your local network. Please report security problems privately, not in a
 public issue: use GitHub's "Report a vulnerability" (Security tab → Advisories),
-or email raul@bestmail.us. Expect a first reply within a week.
+or email rich.egg7277@fastmail.com. Expect a first reply within a week.
 
 Supported versions: the latest release.
 
