@@ -20,17 +20,15 @@ Changes since the last pre-release (0.3.3).
   beside it; `ReadingGuard.pending` is a list of keys (the runs are internal). State saved by 0.3.x still loads.
 - Every `from_dict()` accepts any mapping and raises `ProfileError` for malformed data, where some raised
   `KeyError`/`TypeError`/`ValueError` before.
-- A body without framing that ends without close_notify is a `MeterProtocolError`.
 - `MeterHttpError(path, status, reason_phrase)` keeps the HTTP reason phrase as `.reason_phrase`; the keyword
   argument and attribute were `reason` (`MeterAuthError.reason` is the `AuthReason`).
-- Bytes after a complete response close the connection instead of being read as the next response, whether they
-  arrive with it or later (a stray blank line is tolerated). A kept-alive connection is checked before reuse.
+- Bytes after a complete response close the connection instead of being read as the next response.
 
 ### Reading guard
 
 - `ReadingGuard.accept(snapshot, profile, now=None)` filters a whole `MeterSnapshot`: readings the meter flags
   questionable and reads that failed become None, summation channels and ToU tiers (tier 0, the total, included)
-  go through `register()`, power through `power()`. It returns `AcceptedReadings(values, tou)`.
+  go through `register()`, power through `power()`. It returns `AcceptedReadings(values, tou, rebased)`.
   `questionable(measurement)` exposes the meter's own verdict on a reading.
 - A register may grow by `max_power` times its allowance: the time since its value was first seen, but no more than
   `max_refresh` (90 min) past its latest accepted read. A ToU tier the meter refreshes hourly may step by what the
@@ -42,8 +40,7 @@ Changes since the last pre-release (0.3.3).
   anything. A run survives a restart (it is part of `to_dict()`) and tolerates one stray read per four consistent
   ones.
 - Every adoption is recorded in `.rebases` (downward ones also in `.resets`) and named in
-  `AcceptedReadings.rebased`. The replaced baseline is kept for a day, and the guard returns to it at once if the
-  meter does.
+  `AcceptedReadings.rebased`.
 - All times are the consumer's clock, never the meter's; if it steps back, a register is allowed `max_refresh`.
   `register(..., monotonic=False)` guards a net register. `restore()` ignores malformed entries one by one.
 
@@ -58,24 +55,14 @@ Changes since the last pre-release (0.3.3).
   leaves no pin if the walk fails.
 - A replayed snapshot keeps `MeterNotFound` and `MeterHttpError` as such, and replaying is idempotent.
 - `KEY_SCHEME`, `PROFILE_VERSION`, `TIME_ERROR_KEY`, `Reading` and `short_lfdi` are exported from the package root.
-  Exceptions can be copied and pickled with their state. Messages and logs, debug logs included, show only the last
-  six digits of an LFDI (`short_lfdi`) and the last three of an SFDI in an mDNS name, which tells devices apart
-  without revealing them; attributes keep them whole. A cached profile's `poll_rate` is bounded like a discovered one.
+  Messages and logs, debug logs included, show only the last six digits of an LFDI (`short_lfdi`) and the last three
+  of an SFDI in an mDNS name, which tells devices apart without revealing them; attributes keep them whole.
 
-### Input a healthy meter never sends
+### Privacy
 
-Everything fails as a typed `MeterError`, quickly and within bounded memory:
-- Chunked framing is bounded at every step (size line, declared size, body, trailers); sizes are hex, optionally
-  zero-padded. `Content-Length` must be plain digits. Buffers grow in place.
-- XML with a document type declaration, an encoding expat cannot read, or more than 100,000 markup characters
-  (`<` or `=`) is refused. Element text is clamped to 1024 characters, hrefs over 1024 are refused, and integers must be plain ASCII
-  digits short enough for a 2030.5 type (never truncated). `pollRate` is bounded to UInt32.
-- Durations and interval lengths are bounded to UInt32, `localID` to HexBinary16, `touTier` to UInt8, and date
-  arithmetic past the calendar is an error. A discovered and a cached `ReadingType` are checked alike.
-- Lists longer than 2000 items, needing over 200 pages or over 8 MiB are refused; repeated href-less items end the
-  walk.
-- Device text in error messages is truncated. `PeerCertificate` leaves the DER (which can hold a serial number) out
-  of `repr()`. Non-ASCII PEM raises `InvalidIdentity` without carrying the key text in the exception's context.
+- `PeerCertificate` leaves the DER (which can hold a serial number) out of `repr()`. Non-ASCII PEM raises
+  `InvalidIdentity` without carrying the key text in the exception's context. Device text in error messages is
+  truncated.
 
 ### Command line, docs and packaging
 

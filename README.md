@@ -21,8 +21,7 @@ This library is designed around that:
 - **TLS session resumption.** A full ECDHE-ECDSA handshake costs the meter ~330 ms; a resumed one
   ~60–160 ms. asyncio's TLS transport cannot resume sessions, so TLS runs through `ssl.MemoryBIO`.
 - **Correct HTTP framing.** It reads by Content-Length or chunked framing; only a response with neither is read to
-  the end of the connection, which must then end with close_notify. Requests are never pipelined, and a connection
-  holding anything after its response is not reused.
+  the end of the connection. Requests are never pipelined.
 - **Policy-free.** There is no polling loop. The only retries are transport-level and bounded:
   - one handshake retry after `BAD_SIGNATURE`;
   - one reconnect when the meter drops a kept-alive connection before answering (GET is idempotent).

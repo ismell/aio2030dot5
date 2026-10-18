@@ -55,22 +55,6 @@ CONTENT_TYPE = "application/sep+xml"
 _READ_SIZE = 16384
 _MAX_HEADER_BYTES = 16384
 _MAX_BODY_BYTES = 4 * 1024 * 1024
-_MAX_CHUNK_LINE_BYTES = 1024
-_MAX_TARGET = 2048  # a resolved href plus our paging query
-_COMPACT_AFTER = 256 * 1024
-_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
-_HEX_DIGITS = re.compile(rb"[0-9A-Fa-f]+")
-_UNREAD_FEEDS = 4  # socket reads before deciding a connection is still clean
-_MAX_BLANK_BYTES = 4  # a stray CRLF or two before a status line is tolerated
-
-
-def _skip_blank_lines(buf: bytes) -> bytes:
-    """Drop a few leading CRLFs: some servers end a body with an extra one."""
-    stripped = buf.lstrip(b"\r\n")
-    return stripped if len(buf) - len(stripped) <= _MAX_BLANK_BYTES else buf
-
-
-_CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")
 
 
 def build_ssl_context(cert_path: str | os.PathLike[str], key_path: str | os.PathLike[str]) -> ssl.SSLContext:
@@ -313,7 +297,6 @@ class _TlsConnection:
         self._tap = tap  # fed raw bytes until the handshake ends
         self._buffer = b""
         self.eof = False
-        self.truncated = False
         self.requests = 0
         self.last_used = time.monotonic()
 
@@ -443,11 +426,8 @@ class _TlsConnection:
                 # On EOF, loop once more so the engine can report close_notify
                 # (b"" above) or a truncated stream (SSLEOFError below).
                 await self._feed()
-            except ssl.SSLZeroReturnError:
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
                 self.eof = True
-                return b""
-            except ssl.SSLEOFError:
-                self.eof = self.truncated = True  # TCP FIN without close_notify
                 return b""
             except ssl.SSLError as err:
                 # Agents that let an unregistered client finish the handshake
@@ -455,45 +435,13 @@ class _TlsConnection:
                 raise _classify_ssl_error(err, handshake=False) from err
 
     @property
-    def leftover(self) -> int:
-        """Bytes received after the last complete response (none expected; a
-        stray blank line some servers add after a body does not count)."""
-        return len(_skip_blank_lines(self._buffer))
-
-    async def unread(self) -> bool:
-        """Whether anything arrived that no request asked for.
-
-        Takes in what the socket already holds (without waiting for more) and
-        decrypts it, so the answer does not depend on how the meter split its
-        writes: a stray blank line after a body is fine wherever it lands, an
-        extra response is not. A close or a TLS alert also counts. Bytes still
-        on their way cannot be seen: HTTP/1.1 cannot tell them from the next
-        answer."""
-        for _ in range(_UNREAD_FEEDS):
-            try:
-                async with asyncio.timeout(0):  # expires at the loop's next turn
-                    if not await self._feed():
-                        return True
-            except TimeoutError:
-                break  # nothing more buffered
-        while self._in.pending or self._ssl.pending():
-            try:
-                data = self._ssl.read(_READ_SIZE)
-            except ssl.SSLWantReadError:
-                break  # a partial record (counted below) or a handshake message
-            except ssl.SSLError:
-                return True
-            if not data:
-                self.eof = True
-                return True
-            self._buffer += data
-            if self.leftover:
-                return True
-        return bool(self.leftover or self._in.pending)
+    def leftover(self) -> bool:
+        """True if bytes arrived after the last complete response (none expected)."""
+        return bool(self._buffer)
 
     async def read_response(self) -> Response:
         """Read exactly one HTTP/1.1 response, framed by its own headers."""
-        buf = _skip_blank_lines(self._buffer)
+        buf = self._buffer
         while b"\r\n\r\n" not in buf:
             if len(buf) > _MAX_HEADER_BYTES:
                 raise MeterProtocolError("HTTP response headers too large")
@@ -507,7 +455,7 @@ class _TlsConnection:
                 raise _EmptyResponse(str(err)) from err
             if not chunk:
                 raise _EmptyResponse() if not buf else MeterConnectionError("meter closed the connection mid-headers")
-            buf = _skip_blank_lines(buf + chunk)
+            buf += chunk
         head, rest = buf.split(b"\r\n\r\n", 1)
         lines = head.decode("iso-8859-1").split("\r\n")
         try:
@@ -535,10 +483,11 @@ class _TlsConnection:
             # Chunked framing wins over Content-Length (RFC 9112 section 6.3).
             body, self._buffer = await self._read_chunked(rest)
         elif "content-length" in headers:
-            if not _CONTENT_LENGTH.fullmatch(headers["content-length"]):
-                raise MeterProtocolError(f"bad Content-Length {short(headers['content-length'])}")
-            length = int(headers["content-length"])
-            if length > _MAX_BODY_BYTES:
+            try:
+                length = int(headers["content-length"])
+            except ValueError as err:
+                raise MeterProtocolError(f"bad Content-Length {short(headers['content-length'])}") from err
+            if length < 0 or length > _MAX_BODY_BYTES:
                 raise MeterProtocolError(f"bad Content-Length {length}")
             body_buf = bytearray(rest)
             while len(body_buf) < length:
@@ -558,78 +507,43 @@ class _TlsConnection:
                 if len(body_buf) > _MAX_BODY_BYTES:
                     raise MeterProtocolError("HTTP body too large")
             rest = bytes(body_buf)
-            if self.truncated:
-                # EOF is the only framing here, so an EOF without close_notify
-                # may have cut the body short.
-                raise MeterProtocolError("meter ended an unframed body without close_notify: it may be cut short")
             body, self._buffer, keep_alive = rest, b"", False
 
         return Response(status, reason[0] if reason else "", headers, body, keep_alive and not self.eof)
 
     async def _read_chunked(self, rest: bytes) -> tuple[bytes, bytes]:
-        """Decode a chunked body, bounded at every step: the size line, the
-        declared size, the body and the trailers. ``buf`` grows in place and
-        each search starts near the new data, so a slow meter costs linear work."""
-        buf = bytearray(rest)
-        body = bytearray()
-        pos = 0  # start of the unread part of buf
+        body = b""
         while True:
-            line_end = await self._fill_until(buf, b"\r\n", pos, _MAX_CHUNK_LINE_BYTES, "chunk size line")
-            size_field = bytes(buf[pos:line_end]).split(b";", 1)[0].strip(b" \t")
-            if not _HEX_DIGITS.fullmatch(size_field):  # 1*HEXDIG: never empty
-                raise MeterProtocolError(f"bad chunk size {short(size_field)}")
-            size_field = size_field.lstrip(b"0") or b"0"  # it may be zero-padded
-            if not _CHUNK_SIZE.fullmatch(size_field):
-                raise MeterProtocolError(f"bad chunk size {short(size_field)}")
-            size = int(size_field, 16)
-            if size > _MAX_BODY_BYTES - len(body):
-                raise MeterProtocolError("HTTP body too large")
-            pos = line_end + 2
-            if size == 0:
-                # Optional trailers, up to the blank line that ends the message.
-                if not await self._fill_upto(buf, pos, 2):
-                    raise MeterConnectionError("meter closed the connection mid-trailer")
-                if buf[pos : pos + 2] == b"\r\n":
-                    return bytes(body), bytes(buf[pos + 2 :])
-                end = await self._fill_until(buf, b"\r\n\r\n", pos, _MAX_HEADER_BYTES, "chunked trailers")
-                return bytes(body), bytes(buf[end + 4 :])
-            while len(buf) < pos + size + 2:
+            while b"\r\n" not in rest:
                 chunk = await self._recv_some()
                 if not chunk:
                     raise MeterConnectionError("meter closed the connection mid-chunk")
-                buf += chunk
-            if buf[pos + size : pos + size + 2] != b"\r\n":
-                raise MeterProtocolError("chunk not terminated by CRLF")
-            body += buf[pos : pos + size]
-            pos += size + 2
-            if pos > _COMPACT_AFTER:  # drop what has been consumed
-                del buf[:pos]
-                pos = 0
-
-    async def _fill_until(self, buf: bytearray, marker: bytes, start: int, limit: int, what: str) -> int:
-        """Read until ``marker`` appears in ``buf`` at or after ``start``, at
-        most ``limit`` bytes past it; the marker's index."""
-        searched = start
-        while True:
-            found = buf.find(marker, searched)
-            if found >= 0:
-                return found
-            if len(buf) - start > limit:
-                raise MeterProtocolError(f"{what} too long")
-            searched = max(start, len(buf) - len(marker) + 1)
-            chunk = await self._recv_some()
-            if not chunk:
-                raise MeterConnectionError(f"meter closed the connection mid-{what}")
-            buf += chunk
-
-    async def _fill_upto(self, buf: bytearray, start: int, count: int) -> bool:
-        """Read until ``buf`` holds ``count`` bytes past ``start``; False at EOF."""
-        while len(buf) < start + count:
-            chunk = await self._recv_some()
-            if not chunk:
-                return False
-            buf += chunk
-        return True
+                rest += chunk
+            size_line, rest = rest.split(b"\r\n", 1)
+            try:
+                size = int(size_line.split(b";")[0], 16)
+            except ValueError as err:
+                raise MeterProtocolError(f"bad chunk size {short(size_line)}") from err
+            if size < 0:
+                raise MeterProtocolError("negative chunk size")
+            while len(rest) < size + 2:
+                chunk = await self._recv_some()
+                if not chunk:
+                    raise MeterConnectionError("meter closed the connection mid-chunk")
+                rest += chunk
+            if size == 0:
+                # Skip optional trailers up to the terminating blank line.
+                while not rest.startswith(b"\r\n") and b"\r\n\r\n" not in rest:
+                    chunk = await self._recv_some()
+                    if not chunk:
+                        raise MeterConnectionError("meter closed the connection mid-trailer")
+                    rest += chunk
+                end = 2 if rest.startswith(b"\r\n") else rest.index(b"\r\n\r\n") + 4
+                return body, rest[end:]
+            body += rest[:size]
+            if len(body) > _MAX_BODY_BYTES:
+                raise MeterProtocolError("HTTP body too large")
+            rest = rest[size + 2 :]
 
     async def close(self) -> None:
         """Send close_notify and close. Never raises; even if cancelled
@@ -1070,11 +984,6 @@ class Batch:
 
     async def _request_once(self, path: str) -> Response:
         t = self._t
-        if self._conn is not None and self._conn.requests and await self._conn.unread():
-            # Something arrived that no request asked for: answering the next
-            # GET from that stream could hand it the wrong body. Reconnect.
-            _LOGGER.debug("%s: unread input on a kept-alive connection; reconnecting", t.host)
-            self._kill()
         if self._conn is None:
             if self._closed:
                 # The batch ended while this request was waiting (e.g. a task
@@ -1112,7 +1021,7 @@ class Batch:
         if conn.leftover:
             # We never pipeline, so bytes after a complete response mean the
             # stream is out of step: never serve them as the next response.
-            _LOGGER.debug("GET %s: %d unexpected bytes after the response; reconnecting", path, conn.leftover)
+            _LOGGER.debug("GET %s: unexpected bytes after the response; reconnecting", path)
             self._kill()
         elif not resp.keep_alive:
             await self.close()
@@ -1142,13 +1051,7 @@ def _request_target(path: str) -> str:
     """Validate a request target taken from meter XML: an origin-form path of
     printable ASCII. Anything else is a protocol error, never a header
     injection or a request to another host."""
-    if (
-        len(path) > _MAX_TARGET
-        or not path.startswith("/")
-        or not path.isascii()
-        or not path.isprintable()
-        or " " in path
-    ):
+    if not path.startswith("/") or not path.isascii() or not path.isprintable() or " " in path:
         raise MeterProtocolError(f"unusable href from meter: {short(path)}")
     return path
 

@@ -39,7 +39,6 @@ from .models import (
     TouRegister,
     _from_iso,
     _iso,
-    add_seconds,
     children,
     interval_values,
     local_name,
@@ -448,7 +447,7 @@ class Meter:
                 rs
                 for rs in await _list_sets(b, channel, self.host, self.port)
                 # A set of unknown length might reach past ``since``: keep it.
-                if rs.start is not None and (rs.duration is None or add_seconds(rs.start, rs.duration) > since)
+                if rs.start is not None and (rs.duration is None or rs.start + timedelta(seconds=rs.duration) > since)
             ]
             values = await _read_sets(b, channel, wanted, complete_only, self.host, self.port)
         return [v for v in values if v.end > since]
@@ -577,7 +576,7 @@ async def _read_sets(
             continue  # the set rolled off the meter since it was listed
         values = interval_values(rs, [Reading.from_xml(e) for e in elems], ch.reading_type)
         if complete_only and rs.start is not None and rs.duration is not None:
-            horizon = add_seconds(rs.start, rs.duration)
+            horizon = rs.start + timedelta(seconds=rs.duration)
             values = [v for v in values if v.end <= horizon]
         out.extend(values)
     out.sort(key=lambda v: v.start)

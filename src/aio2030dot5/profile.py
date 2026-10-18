@@ -13,12 +13,9 @@ derived from what a channel *is* -- quantity, statistic, direction, phase
 
 from __future__ import annotations
 
-import copy
 import enum
-import hashlib
 import logging
 import re
-import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,7 +24,6 @@ from urllib.parse import urljoin, urlsplit
 from .exceptions import MeterProtocolError, ProfileError
 from .identity import sfdi_from_lfdi
 from .models import (
-    MAX_HREF,
     Accumulation,
     DataQualifier,
     DeviceCapability,
@@ -358,7 +354,7 @@ class MeterProfile:
                 software_version=_optional_str(d.get("software_version")),
                 time_href=_optional_str(d.get("time_href")),
                 usage_point_href=d["usage_point_href"],
-                poll_rate=_cached_poll_rate(d.get("poll_rate")),
+                poll_rate=int(d.get("poll_rate") or DEFAULT_POLL_RATE),
                 channels=tuple(Channel.from_dict(c) for c in d["channels"]),
                 device_information_href=_optional_str(d.get("device_information_href")),
                 certificate_lfdi=d.get("certificate_lfdi"),
@@ -386,8 +382,6 @@ def resolve_href(base: str, href: str, host: str, port: int) -> str:
     """
     bare = host.strip("[]").split("%", 1)[0].lower()  # IPv6 literal without zone
     origin = f"https://[{bare}]:{port}" if ":" in bare else f"https://{bare}:{port}"
-    if len(href) > MAX_HREF:
-        raise MeterProtocolError(f"href from meter is {len(href)} characters long: {short(href)}")
     try:
         parts = urlsplit(urljoin(origin + base, href.strip()))
         link_port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -403,13 +397,6 @@ def _paged(href: str, start: int, limit: int) -> str:
     return f"{href}{sep}s={start}&l={limit}"
 
 
-# An Itron agent's longest list is 60 ReadingSets, or 48 Readings in a set,
-# and a whole Itron list is well under 100 KiB.
-MAX_LIST_ITEMS = 2000
-MAX_LIST_PAGES = 200
-MAX_LIST_BYTES = 8 * 1024 * 1024
-
-
 async def get_list(
     batch: Batch, href: str, item: str, *, start: int = 0, limit: int | None = None
 ) -> tuple[ListPage, list[Any]]:
@@ -417,63 +404,23 @@ async def get_list(
 
     Pages are followed by the count actually returned and the list's own
     ``all``: agents return short pages, and a Kitu-based agent's
-    ``ReadingListLink@all`` is stale until the list is fetched once. A list
-    longer than ``MAX_LIST_ITEMS``, or needing more than ``MAX_LIST_PAGES`` GETs
-    or ``MAX_LIST_BYTES`` of responses, is refused: no meter holds that much,
-    and following a device's ``all`` blindly could hold the meter's only
-    connection, and memory, for hours.
+    ``ReadingListLink@all`` is stale until the list is fetched once.
     """
     items: list[Any] = []
     page: ListPage | None = None
-    seen: set[str | bytes] = set()
-    pages = received = 0
+    seen: set[str] = set()
     while True:
-        pages += 1
-        if pages > MAX_LIST_PAGES:
-            raise MeterProtocolError(f"{short(href)} needs more pages than any meter's list")
         want = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(items))
-        body = await batch.get(_paged(href, start, want))
-        received += len(body)
-        if received > MAX_LIST_BYTES:
-            raise MeterProtocolError(f"{short(href)} is larger than any meter's list ({received} bytes)")
-        root = parse_xml(body)
+        root = parse_xml(await batch.get(_paged(href, start, want)))
         if not local_name(root.tag).endswith("List"):
             raise MeterProtocolError(f"{short(href)} is not a list (<{short(local_name(root.tag))}>)")
         page = ListPage.of(root)
-        if page.all > MAX_LIST_ITEMS and limit is None:
-            raise MeterProtocolError(f"{short(href)} claims {page.all} items, more than any meter's list")
-        got = []
-        for e in children(root, item):
-            identity = _identity(e)
-            if identity not in seen:
-                seen.add(identity)
-                got.append(e)
+        got = [e for e in children(root, item) if (e.get("href") or id(e)) not in seen]
+        seen.update(e.get("href") or "" for e in got)
         items.extend(got)
-        if len(items) > MAX_LIST_ITEMS:
-            raise MeterProtocolError(f"{short(href)} is longer than any meter's list ({len(items)} items so far)")
         start += len(got)
         if not got or start >= page.all or (limit is not None and len(items) >= limit):
             return page, items
-
-
-def _identity(elem: ET.Element) -> str | bytes:
-    """What makes a list item the same item on another page: its href, or for
-    an item without one (interval Readings), a digest of its content."""
-    href = elem.get("href")
-    if href:
-        return href
-    bare = copy.copy(elem)
-    bare.tail = None  # the whitespace after an item differs between pages
-    return hashlib.sha256(ET.tostring(bare)).digest()
-
-
-def _cached_poll_rate(value: Any) -> int:
-    """A cached profile's pollRate, bounded like a discovered one (UInt32 seconds)."""
-    if value is None:
-        return DEFAULT_POLL_RATE
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**32:
-        raise ProfileError("malformed poll_rate in a cached profile")
-    return value or DEFAULT_POLL_RATE
 
 
 # -- keys -----------------------------------------------------------------------

@@ -87,9 +87,6 @@ class MeterIdentityMismatch(MeterError):
         self.expected = expected
         self.actual = actual
 
-    def __reduce__(self) -> tuple[type, tuple[str, str, str | None], dict[str, object]]:
-        return type(self), (self.host, self.expected, self.actual), self.__dict__
-
 
 class MeterAuthError(MeterError):
     """The meter rejected our client certificate.
@@ -110,9 +107,6 @@ class MeterAuthError(MeterError):
         super().__init__(message)
         self.reason: AuthReason = reason
 
-    def __reduce__(self) -> tuple[type, tuple[str, AuthReason], dict[str, object]]:
-        return type(self), (str(self), self.reason), self.__dict__
-
 
 class MeterProtocolError(MeterError):
     """The meter answered, but not with something we understand."""
@@ -125,9 +119,6 @@ class InvalidIdentity(MeterError):
     def __init__(self, message: str, problems: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.problems = problems
-
-    def __reduce__(self) -> tuple[type, tuple[str, tuple[str, ...]], dict[str, object]]:
-        return type(self), (str(self), self.problems), self.__dict__
 
 
 class ProfileError(MeterError):
@@ -143,9 +134,6 @@ class MeterHttpError(MeterProtocolError):
         self.path = path
         self.status = status
         self.reason_phrase = reason_phrase
-
-    def __reduce__(self) -> tuple[type, tuple[str, int, str], dict[str, object]]:
-        return type(self), (self.path, self.status, self.reason_phrase), self.__dict__
 
 
 class MeterNotFound(MeterHttpError):

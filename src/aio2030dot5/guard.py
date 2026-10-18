@@ -51,10 +51,7 @@ never form a run. Runs are part of :meth:`ReadingGuard.to_dict`.
 Every adoption is recorded in :attr:`ReadingGuard.rebases` (and reported by
 :meth:`ReadingGuard.accept`), and a downward one also in
 :attr:`ReadingGuard.resets`: a consumer keeping a running total should start a
-new accumulation cycle at either rather than book the step. After a rebase the
-baseline it replaced is kept for ``confirm_seconds``; if the meter comes back
-to it -- the "new series" was a long-lived glitch after all -- the guard returns
-to it at once (another rebase; a reset too if that is a step down).
+new accumulation cycle at either rather than book the step.
 
 If the consumer's clock steps back, the elapsed time is unknown: the register is allowed ``max_refresh`` from there.
 """
@@ -62,7 +59,6 @@ If the consumer's clock steps back, the elapsed time is unknown: the register is
 from __future__ import annotations
 
 import logging
-import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -76,9 +72,6 @@ __all__ = ["AcceptedReadings", "ReadingGuard", "questionable"]
 
 _LOGGER = logging.getLogger(__name__)
 _SLACK_WH = 1000.0
-# Bounds for restored runs: a stored run past these is corrupt, not a long confirmation.
-_MAX_RUN_READS = 1_000_000
-_MAX_RUN_SECONDS = 30 * 86400.0
 
 
 @dataclass(slots=True)
@@ -91,11 +84,6 @@ class _Run:
     count: int = 1  # consistent reads
     strays: int = 0  # inconsistent reads tolerated inside the run
     observed: float = 0.0  # seconds of observation, each gap counted up to confirm_seconds / confirm
-
-
-def _strays_allowed(strays: int, count: int) -> bool:
-    """The run invariant: at most one stray per four consistent reads."""
-    return 0 <= strays and strays * 4 <= count
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,9 +133,6 @@ class ReadingGuard:
         # key -> epoch seconds of the last rebase of any kind / of a downward one
         self.rebases: dict[str, float] = {}
         self.resets: dict[str, float] = {}
-        # key -> (value, first seen, last seen) of the baseline the last rebase
-        # replaced; kept for confirm_seconds after that rebase
-        self.displaced: dict[str, tuple[float, float, float]] = {}
         self._pending: dict[str, _Run] = {}
         self.rejected = 0
         self._rejecting: set[str] = set()  # keys in a run of rejections (logged once)
@@ -232,10 +217,6 @@ class ReadingGuard:
             first_seen, last_seen = now - self.max_refresh, now
             self.registers[key] = (last_value, first_seen)
             self.last_seen[key] = now
-        displaced = self.displaced.get(key)
-        if displaced is not None and now - self.rebases.get(key, displaced[2]) > self.confirm_seconds:
-            del self.displaced[key]  # expired: the new series stands
-            displaced = None
         if value == last_value or (monotonic and last_value - self._hold_margin <= value < last_value):
             # Unchanged -- or a little below an accepted value, which a register
             # that never decreases can only be after a small glitch was accepted:
@@ -245,14 +226,6 @@ class ReadingGuard:
             self._recovered(key)
             return last_value
         if self._plausible(last_value, first_seen, last_seen, value, now, monotonic):
-            self._adopt(key, value, now)
-            return value
-        if displaced is not None and self._plausible(*displaced, value, now, monotonic):
-            _LOGGER.warning("%s: back to the earlier series at %s (was %s)", key, value, last_value)
-            del self.displaced[key]
-            self.rebases[key] = now
-            if monotonic and value < last_value:
-                self.resets[key] = now  # a step down: a new cycle for a consumer's running total
             self._adopt(key, value, now)
             return value
         run = self._track(key, value, now, monotonic)
@@ -269,8 +242,7 @@ class ReadingGuard:
         )
         self.rebases[key] = now
         if monotonic and value < last_value:
-            self.resets[key] = now
-        self.displaced[key] = (last_value, first_seen, last_seen)
+            self.resets[key] = now  # a step down: a new cycle for a consumer's running total
         self._adopt(key, value, now)
         return value
 
@@ -286,7 +258,7 @@ class ReadingGuard:
                 run.last_read = now
                 run.count += 1
                 return run
-            if _strays_allowed(run.strays + 1, run.count):
+            if (run.strays + 1) * 4 <= run.count:  # one stray per four consistent reads
                 run.strays += 1  # no time: only consistent reads observe the series
                 return None
         run = self._pending[key] = _Run(value, now, now)
@@ -335,7 +307,6 @@ class ReadingGuard:
             "last_seen": dict(self.last_seen),
             "rebases": dict(self.rebases),
             "resets": dict(self.resets),
-            "displaced": {key: list(reading) for key, reading in self.displaced.items()},
             "pending": {
                 key: [r.value, r.first_seen, r.last_read, r.count, r.strays, r.observed]
                 for key, r in self._pending.items()
@@ -351,18 +322,13 @@ class ReadingGuard:
 
     def restore(self, data: Any) -> None:
         """Load :meth:`to_dict` output (also 0.3.x state) into this guard, e.g. one
-        built with other limits. Malformed entries are ignored one by one; the
-        rest is kept."""
+        built with other limits. Entries that do not parse are skipped."""
         if not isinstance(data, Mapping):
             return
         for key, reading in _items(data.get("registers")):
             numbers = _numbers(reading, 2)
             if numbers is not None:
                 self.registers[str(key)] = (numbers[0], numbers[1])
-        for key, reading in _items(data.get("displaced")):
-            numbers = _numbers(reading, 3) or _numbers(reading, 2)  # 2: saved before last_seen was kept
-            if numbers is not None:
-                self.displaced[str(key)] = (numbers[0], numbers[1], numbers[-1])
         for name in ("last_seen", "rebases", "resets"):
             target = getattr(self, name)
             for key, when in _items(data.get(name)):
@@ -371,17 +337,8 @@ class ReadingGuard:
                     target[str(key)] = numbers[0]
         for key, run in _items(data.get("pending")):
             numbers = _numbers(run, 6)
-            if numbers is None:
-                continue
-            value, first_seen, last_read, count, strays, observed = numbers
-            if (
-                count.is_integer()
-                and strays.is_integer()
-                and 1 <= count <= _MAX_RUN_READS
-                and _strays_allowed(int(strays), int(count))
-                and 0 <= observed <= _MAX_RUN_SECONDS
-                and first_seen <= last_read
-            ):
+            if numbers is not None:
+                value, first_seen, last_read, count, strays, observed = numbers
                 self._pending[str(key)] = _Run(value, first_seen, last_read, int(count), int(strays), observed)
 
 
@@ -391,23 +348,10 @@ def _items(section: Any) -> list[tuple[Any, Any]]:
 
 
 def _numbers(entry: Any, length: int) -> list[float] | None:
-    """A stored list of ``length`` finite numbers, or None if it is anything else."""
+    """A stored list of ``length`` numbers, or None if it is anything else."""
     if not isinstance(entry, list | tuple) or len(entry) != length:
         return None
     try:
-        return [_finite(x) for x in entry]
-    except ValueError:
+        return [float(x) for x in entry]
+    except (TypeError, ValueError):
         return None
-
-
-def _finite(value: Any) -> float:
-    """A stored number; ValueError for anything else: bools, strings, NaN, infinities."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"not a number: {value!r}")
-    try:
-        number = float(value)
-    except OverflowError:
-        raise ValueError("too large") from None
-    if not math.isfinite(number):
-        raise ValueError(f"not finite: {value!r}")
-    return number

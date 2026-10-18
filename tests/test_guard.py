@@ -109,27 +109,12 @@ def test_a_meter_answering_zero_for_a_while_is_not_a_reset() -> None:
     assert guard.resets == {} and guard.rebases == {}
 
 
-def test_a_drop_lasting_a_day_is_a_reset_and_the_old_series_can_return() -> None:
+def test_a_drop_lasting_a_day_is_a_reset() -> None:
     guard = ReadingGuard()
     guard.register("r", LIFETIME, NOW)
     results = _series(guard, [float(i) for i in range(100)], NOW, QUARTER)
     assert results[:96] == [None] * 96 and results[96] == 96.0  # adopted after 24 h
     assert guard.resets["r"] == guard.rebases["r"] == NOW + 97 * QUARTER
-    # The meter returns to its real register: back to the earlier series at once,
-    # recorded as another rebase so a consumer starts a new cycle, not a 50 MWh step.
-    t = NOW + 101 * QUARTER
-    assert guard.register("r", LIFETIME + 100, t) == LIFETIME + 100
-    assert guard.rebases["r"] == t and "r" not in guard.displaced
-
-
-def test_a_stuck_high_value_adopted_after_a_day_gives_way_to_the_real_register() -> None:
-    guard = ReadingGuard()
-    guard.register("r", LIFETIME, NOW)
-    results = _series(guard, [9e9] * 100, NOW, QUARTER)  # stuck for a day: adopted
-    assert results[-1] == 9e9 and "r" in guard.rebases
-    t = NOW + 101 * QUARTER
-    assert guard.register("r", LIFETIME + 50, t) == LIFETIME + 50  # back at once, not after a day
-    assert guard.resets == {"r": t}  # a return that steps down is a new cycle
 
 
 def test_a_confirmation_survives_restarts() -> None:
@@ -202,14 +187,10 @@ def test_the_state_survives_a_restart() -> None:
     guard = ReadingGuard()
     guard.register("r", 1_000.0, 0.0)
     guard.resets["r"] = guard.rebases["r"] = 5.0
-    guard.displaced["r"] = (9_000.0, 1.0, 2.0)
     data = guard.to_dict()
-    data["registers"]["bad"] = "x"
-    data["resets"]["worse"] = "y"
     restarted = ReadingGuard.from_dict(data)
     assert restarted.registers == {"r": (1_000.0, 0.0)}
     assert restarted.resets == restarted.rebases == {"r": 5.0}
-    assert restarted.displaced == {"r": (9_000.0, 1.0, 2.0)}
     assert restarted.register("r", 9e9, 60.0) is None
     for junk in (None, [1], {"registers": [1], "resets": 3}):
         assert ReadingGuard.from_dict(junk).registers == {}
@@ -384,19 +365,11 @@ def test_a_register_refreshed_hourly_is_not_a_spike() -> None:
     assert guard.registers["tier"] == (1_007_500.0, NOW + 67 * 60)
 
 
-def test_malformed_saved_state_is_ignored_entry_by_entry() -> None:
+def test_saved_entries_that_do_not_parse_are_skipped() -> None:
     state = {
-        "registers": {"ok": [1.0, 2.0], "dict": {"x": 1}, "short": "ab", "inf": [1, float("inf")], "long": [1, 2, 3]},
-        "pending": {
-            "ok": [1, 2, 3, 4, 1, 0],  # a run that tolerated one stray: kept
-            "huge": [1, 2, 3, 10**400, 0, 0],
-            "strays": [1, 2, 3, 2, 9, 0],
-            "fraction": [1, 2, 3, 4.5, 0, 0],
-            "backwards": [1, 5, 3, 4, 0, 0],
-            "text": [1, 2, 3, "4", 0, 0],
-            "dict": {"a": 1},
-        },
-        "rebases": {"ok": 5, "bool": True, "huge": 10**400, "text": "5"},
+        "registers": {"ok": [1.0, 2.0], "dict": {"x": 1}, "short": [1.0], "text": ["a", 2.0]},
+        "pending": {"ok": [1, 2, 3, 4, 1, 0], "short": [1, 2]},
+        "rebases": {"ok": 5, "text": "five"},
     }
     guard = ReadingGuard.from_dict(state)
     assert guard.registers == {"ok": (1.0, 2.0)}

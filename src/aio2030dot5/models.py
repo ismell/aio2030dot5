@@ -115,21 +115,7 @@ UNIT_SYMBOLS: dict[Uom, str] = {
 # -- XML helpers --------------------------------------------------------------
 
 
-_DOCTYPE = ("<!DOCTYPE", "<!ENTITY")
-_DOCTYPE_BYTES = tuple(m.encode(enc) for m in _DOCTYPE for enc in ("ascii", "utf-16-le", "utf-16-be"))
-MAX_TEXT = 1024  # no 2030.5 text element is longer than a few dozen characters
-MAX_ELEMENTS = 100_000  # tags or attributes; a full page of 255 Readings has a few thousand
-
-
 def parse_xml(body: bytes | str) -> ET.Element:
-    """Parse a resource. A document type declaration is refused outright: no
-    2030.5 resource has one, and internal entities would let a device inflate
-    a capped response by orders of magnitude."""
-    if any(m in body for m in (_DOCTYPE if isinstance(body, str) else _DOCTYPE_BYTES)):  # type: ignore[operator]
-        raise MeterProtocolError("XML from meter has a document type declaration")
-    lt, eq = ("<", "=") if isinstance(body, str) else (b"<", b"=")
-    if body.count(lt) > MAX_ELEMENTS or body.count(eq) > MAX_ELEMENTS:  # type: ignore[arg-type]
-        raise MeterProtocolError("XML from meter has more markup than any 2030.5 resource")
     try:
         return ET.fromstring(body)
     except (ET.ParseError, ValueError, LookupError) as err:
@@ -183,53 +169,26 @@ def children(elem: ET.Element, name: str) -> list[ET.Element]:
 
 
 def text(elem: ET.Element, name: str) -> str | None:
-    """A child element's text, stripped and at most ``MAX_TEXT`` characters."""
     c = child(elem, name)
     if c is None or c.text is None:
         return None
-    t = c.text.strip(_XML_SPACE)[:MAX_TEXT]
+    t = c.text.strip()
     return t or None
-
-
-def _number_text(elem: ET.Element, name: str) -> str | None:
-    """A numeric child's text, unclamped: a number too long for any 2030.5
-    type is an error, never silently truncated."""
-    c = child(elem, name)
-    t = c.text.strip(_XML_SPACE) if c is not None and c.text is not None else ""
-    if len(t) > 40:
-        raise MeterProtocolError(f"<{name}> is {len(t)} characters long: {short(t)}")
-    return t or None
-
-
-_INTEGER = re.compile(r"[+-]?[0-9]+")
-_XML_SPACE = " \t\r\n"  # the whitespace XML Schema collapses; no other
 
 
 def int_or_none(elem: ET.Element, name: str) -> int | None:
-    t = _number_text(elem, name)
+    t = text(elem, name)
     if t is None:
         return None
-    if not _INTEGER.fullmatch(t):  # xs:integer: no "1_000", no non-ASCII digits
-        raise MeterProtocolError(f"<{name}> is not an integer: {short(t)}")
-    return int(t)
-
-
-MAX_HREF = 1024  # no 2030.5 path comes close; an Itron agent's longest is ~25 characters
-
-
-def href_of(elem: ET.Element | None, default: str | None = None) -> str | None:
-    """An element's ``href`` attribute, refused past ``MAX_HREF`` characters
-    (it ends up in persisted profiles and error messages)."""
-    value = elem.get("href") if elem is not None else None
-    if value is None:
-        return default
-    if len(value) > MAX_HREF:
-        raise MeterProtocolError(f"href from meter is {len(value)} characters long: {short(value)}")
-    return value
+    try:
+        return int(t)
+    except ValueError as err:
+        raise MeterProtocolError(f"<{name}> is not an integer: {short(t)}") from err
 
 
 def link(elem: ET.Element, name: str) -> str | None:
-    return href_of(child(elem, name))
+    c = child(elem, name)
+    return c.get("href") if c is not None else None
 
 
 def expect_root(elem: ET.Element, name: str) -> None:
@@ -250,33 +209,25 @@ def int_attr(elem: ET.Element, name: str, default: int = 0) -> int:
     raw = elem.get(name)
     if raw is None:
         return default
-    if len(raw) > 40 or not _INTEGER.fullmatch(raw.strip(_XML_SPACE)):
-        raise MeterProtocolError(f"attribute {name}={short(raw)} is not an integer")
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError as err:
+        raise MeterProtocolError(f"attribute {name}={short(raw)} is not an integer") from err
 
 
-_HEX = re.compile(r"[0-9A-Fa-f]+")
+_HEX = re.compile(r"[0-9A-Fa-f]{1,16}")
 
 
-def hex_or_none(value: str | None, what: str, digits: int = 16) -> int | None:
-    """Strict hexBinary of at most ``digits`` hex digits: no sign, prefix or padding."""
+def hex_or_none(value: str | None, what: str) -> int | None:
+    """Strict hexBinary: digits only -- no sign, prefix or padding."""
     if value is None:
         return None
-    if len(value) > digits or not _HEX.fullmatch(value):
-        raise MeterProtocolError(f"{what} {short(value)} is not hexBinary of up to {digits} digits")
+    if not _HEX.fullmatch(value):
+        raise MeterProtocolError(f"{what} {short(value)} is not hexBinary")
     return int(value, 16)
 
 
 INT48 = 2**47  # Reading values are Int48
-UINT32 = 2**32  # durations and interval lengths, in seconds
-
-
-def add_seconds(start: datetime, seconds: int) -> datetime:
-    """``start`` plus ``seconds``, or MeterProtocolError past the calendar's end."""
-    try:
-        return start + timedelta(seconds=seconds)
-    except OverflowError as err:
-        raise MeterProtocolError(f"{start.isoformat()} + {seconds} s is out of range") from err
 
 
 def int_in_range(elem: ET.Element, name: str, lo: int, hi: int) -> int | None:
@@ -284,16 +235,6 @@ def int_in_range(elem: ET.Element, name: str, lo: int, hi: int) -> int | None:
     if value is not None and not lo <= value < hi:
         raise MeterProtocolError(f"<{name}> {value} out of range")
     return value
-
-
-def _poll_rate(elem: ET.Element) -> int | None:
-    """A list's pollRate attribute (UInt32 seconds), or None."""
-    if not elem.get("pollRate"):
-        return None
-    rate = int_attr(elem, "pollRate")
-    if not 0 <= rate < UINT32:
-        raise MeterProtocolError(f"pollRate {rate} out of range")
-    return rate
 
 
 # -- resources ----------------------------------------------------------------
@@ -312,7 +253,7 @@ class ListPage:
         return cls(
             all=int_attr(elem, "all"),
             results=int_attr(elem, "results"),
-            poll_rate=_poll_rate(elem),
+            poll_rate=int_attr(elem, "pollRate") if elem.get("pollRate") else None,
         )
 
 
@@ -445,7 +386,7 @@ class UsagePoint:
         """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(elem, "UsagePoint")
         return cls(
-            href=href_of(elem, "") or "",
+            href=elem.get("href", ""),
             description=text(elem, "description"),
             service_category=int_or_none(elem, "serviceCategoryKind"),
             status=int_or_none(elem, "status"),
@@ -470,7 +411,7 @@ class MeterReadingInfo:
         """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(elem, "MeterReading")
         return cls(
-            href=href_of(elem, "") or "",
+            href=elem.get("href", ""),
             mrid=text(elem, "mRID"),
             description=text(elem, "description"),
             reading_type_href=link(elem, "ReadingTypeLink"),
@@ -530,17 +471,9 @@ class ReadingType:
     def from_xml(cls, root: ET.Element) -> ReadingType:
         """Parse the resource from the meter; ``MeterProtocolError`` if it is malformed."""
         expect_root(root, "ReadingType")
-        # Bounded exactly like from_dict, so a profile discovery produced always loads again.
-        values: dict[str, int | None] = {
-            attr: (
-                int_in_range(root, tag, -128, 128)
-                if attr == "power_of_ten_multiplier"
-                else int_in_range(root, tag, 0, UINT32)
-            )
-            or 0
-            for attr, tag in cls._FIELDS
-        }
-        values["interval_length"] = int_in_range(root, "intervalLength", 0, UINT32)
+        values: dict[str, int | None] = {attr: int_or_none(root, tag) or 0 for attr, tag in cls._FIELDS}
+        values["power_of_ten_multiplier"] = int_in_range(root, "powerOfTenMultiplier", -128, 128) or 0  # Int8
+        values["interval_length"] = int_or_none(root, "intervalLength")
         return cls(**values)  # type: ignore[arg-type]
 
     @property
@@ -565,22 +498,9 @@ class ReadingType:
     @classmethod
     @restores
     def from_dict(cls, d: Mapping[str, int | None]) -> ReadingType:
-        """Restore :meth:`to_dict` output, checked like :meth:`from_xml`;
-        ``ProfileError`` if it is not (a cached profile from elsewhere)."""
-
-        def field(tag: str, lo: int, hi: int, default: int | None = 0) -> int | None:
-            value = d.get(tag)
-            if value is None:
-                return default
-            if not isinstance(value, int) or isinstance(value, bool) or not lo <= value < hi:
-                raise ProfileError(f"cached ReadingType has a bad {tag}: {short(value)}")
-            return value
-
-        values: dict[str, int | None] = {
-            attr: field(tag, -128, 128) if attr == "power_of_ten_multiplier" else field(tag, 0, UINT32)
-            for attr, tag in cls._FIELDS
-        }
-        values["interval_length"] = field("intervalLength", 0, UINT32, None)
+        """Restore :meth:`to_dict` output; ``ProfileError`` if it is malformed."""
+        values: dict[str, int | None] = {attr: int(d.get(tag) or 0) for attr, tag in cls._FIELDS}
+        values["interval_length"] = d.get("intervalLength")
         return cls(**values)  # type: ignore[arg-type]
 
 
@@ -604,17 +524,17 @@ class Reading:
         start = duration = None
         if period is not None:
             start = int_or_none(period, "start")
-            duration = int_in_range(period, "duration", 0, UINT32)
-        quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags", 4)
+            duration = int_or_none(period, "duration")
+        quality = hex_or_none(text(elem, "qualityFlags"), "qualityFlags")
         return cls(
-            href=href_of(elem),
+            href=elem.get("href"),
             raw_value=int_in_range(elem, "value", -INT48, INT48),
             start=epoch(start),
             duration=duration,
-            tou_tier=int_in_range(elem, "touTier", 0, 256),  # UInt8
+            tou_tier=int_or_none(elem, "touTier"),
             quality=QualityFlags(quality) if quality is not None else None,
-            # localID is HexBinary16 in the schema ("2F" for slot 47).
-            local_id=hex_or_none(text(elem, "localID"), "localID", 4),
+            # localID is hexBinary in the schema ("2F" for slot 47).
+            local_id=hex_or_none(text(elem, "localID"), "localID"),
         )
 
 
@@ -637,14 +557,14 @@ class ReadingSetInfo:
         start = duration = None
         if period is not None:
             start = int_or_none(period, "start")
-            duration = int_in_range(period, "duration", 0, UINT32)
+            duration = int_or_none(period, "duration")
         rl = child(elem, "ReadingListLink")
         return cls(
-            href=href_of(elem, "") or "",
+            href=elem.get("href", ""),
             description=text(elem, "description"),
             start=epoch(start),
             duration=duration,
-            reading_list_href=href_of(rl),
+            reading_list_href=rl.get("href") if rl is not None else None,
             reading_count=int_attr(rl, "all") if rl is not None and rl.get("all") else None,
         )
 
@@ -758,13 +678,13 @@ def interval_values(
     length = reading_type.interval_length
     if not length:
         raise MeterProtocolError("interval ReadingType has no intervalLength")
-    set_end = add_seconds(reading_set.start, reading_set.duration) if reading_set.duration else None
+    set_end = reading_set.start + timedelta(seconds=reading_set.duration) if reading_set.duration else None
     out = []
     for r in readings:
         if r.start is not None:
             start = r.start
         elif r.local_id is not None:
-            start = add_seconds(reading_set.start, r.local_id * length)
+            start = reading_set.start + timedelta(seconds=r.local_id * length)
         else:
             continue
         # A slot outside its own set (an agent numbering localID globally, a
@@ -774,7 +694,7 @@ def interval_values(
         out.append(
             IntervalValue(
                 start=start,
-                end=add_seconds(start, r.duration or length),
+                end=start + timedelta(seconds=r.duration or length),
                 value=reading_type.scale(r.raw_value),
                 unit=reading_type.unit,
                 uom=reading_type.uom,
@@ -873,11 +793,7 @@ def hourly_energy(values: Iterable[IntervalValue], *, complete_only: bool = True
             raise ValueError(f"intervals mix units: {unit} and {v.unit}")
         start, end = v.start.astimezone(UTC), v.end.astimezone(UTC)
         hour = start.replace(minute=0, second=0, microsecond=0)
-        try:
-            hour_end = hour + timedelta(hours=1)
-        except OverflowError:
-            raise ValueError(f"interval at {start:%Y-%m-%d %H:%M} is past the calendar's end") from None
-        if end <= start or end > hour_end:
+        if end <= start or end > hour + timedelta(hours=1):
             raise ValueError(f"interval {start:%Y-%m-%d %H:%M}-{end:%H:%M} is not within one clock hour")
         by_hour.setdefault(hour, {})[(start, end)] = v
     out = []
@@ -907,9 +823,9 @@ def _from_iso(value: str | None) -> datetime | None:
 
 
 def _sfdi(value: str | None) -> str | None:
-    if value is None:
+    if value is None or not value.strip():
         return None
-    if not value.isascii() or not value.isdigit():
+    if not value.strip().isascii() or not value.strip().isdigit():
         raise MeterProtocolError(f"sFDI is not a number: {value!r}")
     return str(int(value))  # agents may zero-pad it
 
