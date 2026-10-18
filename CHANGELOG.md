@@ -18,8 +18,9 @@ Changes since the last pre-release (0.3.3).
   a day of observation as well as reads, in both directions (it was 3 reads in 1 h upward). The constructor takes
   `max_power`, `confirm`, `confirm_seconds` and `max_refresh`. `ReadingGuard.registers` holds `(value, first seen)`, with `.last_seen`
   beside it; `ReadingGuard.pending` is a list of keys (the runs are internal). State saved by 0.3.x still loads.
-- Every `from_dict()` accepts any mapping and raises `ProfileError` for malformed data, where some raised
-  `KeyError`/`TypeError`/`ValueError` before.
+- Every `from_dict()` accepts any mapping and raises `ProfileError` for malformed data (`Identity`:
+  `InvalidIdentity`), where some raised `KeyError`/`TypeError`/`ValueError` before. `ReadingGuard.from_dict()`
+  restores its own `to_dict()` output and 0.3.x state.
 - `MeterHttpError(path, status, reason_phrase)` keeps the HTTP reason phrase as `.reason_phrase`; the keyword
   argument and attribute were `reason` (`MeterAuthError.reason` is the `AuthReason`).
 - Bytes after a complete response close the connection instead of being read as the next response.
@@ -42,7 +43,7 @@ Changes since the last pre-release (0.3.3).
 - Every adoption is recorded in `.rebases` (downward ones also in `.resets`) and named in
   `AcceptedReadings.rebased`.
 - All times are the consumer's clock, never the meter's; if it steps back, a register is allowed `max_refresh`.
-  `register(..., monotonic=False)` guards a net register. `restore()` ignores malformed entries one by one.
+  `register(..., monotonic=False)` guards a net register.
 
 ### Meter
 
@@ -56,13 +57,14 @@ Changes since the last pre-release (0.3.3).
 - A replayed snapshot keeps `MeterNotFound` and `MeterHttpError` as such, and replaying is idempotent.
 - `KEY_SCHEME`, `PROFILE_VERSION`, `TIME_ERROR_KEY`, `Reading` and `short_lfdi` are exported from the package root.
   Messages and logs, debug logs included, show only the last six digits of an LFDI (`short_lfdi`) and the last three
-  of an SFDI in an mDNS name, which tells devices apart without revealing them; attributes keep them whole.
+  of an SFDI in an mDNS name, which tells devices apart without revealing them; attributes keep them whole. A host
+  you pass appears as given, so pass an address rather than the meter's `itrondnsserver-<SFDI>.local` name if logs
+  will be shared.
 
 ### Privacy
 
 - `PeerCertificate` leaves the DER (which can hold a serial number) out of `repr()`. Non-ASCII PEM raises
-  `InvalidIdentity` without carrying the key text in the exception's context. Device text in error messages is
-  truncated.
+  `InvalidIdentity` without carrying the key text in the exception's context.
 
 ### Command line, docs and packaging
 

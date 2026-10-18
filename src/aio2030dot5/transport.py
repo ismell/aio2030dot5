@@ -180,10 +180,10 @@ class Response:
 class PeerCertificate:
     """The certificate a meter presented, and the identity it implies.
 
-    In IEEE 2030.5 a device's LFDI *is* the SHA-256 of its device certificate,
-    so this identifies the meter whatever its address: on an Itron Gen5 Riva it
-    equals the ``/sdev`` lFDI, and the SFDI is the one in its mDNS instance
-    name. It is not verified against a CA -- pin it (trust on first use).
+    In IEEE 2030.5 a device's LFDI *is* the leftmost 160 bits of the SHA-256
+    of its device certificate, so this identifies the meter whatever its
+    address: on an Itron Gen5 Riva it equals the ``/sdev`` lFDI, and the SFDI
+    is the one in its mDNS instance name. It is not verified against a CA -- pin it (trust on first use).
     """
 
     # Left out of repr(): the DER is kilobytes, and a meter's certificate can

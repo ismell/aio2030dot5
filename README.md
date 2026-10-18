@@ -26,8 +26,7 @@ This library is designed around that:
   - one handshake retry after `BAD_SIGNATURE`;
   - one reconnect when the meter drops a kept-alive connection before answering (GET is idempotent).
 
-  Exceptions say what happened, and the caller decides. Everything the meter (or a device at its address) causes
-  is a `MeterError`; mistakes in the calling code raise `ValueError` or `RuntimeError`.
+  Exceptions say what happened, and the caller decides. Everything the meter causes is a `MeterError`; mistakes in the calling code raise `ValueError` or `RuntimeError`.
 
   ```
   MeterError
@@ -174,8 +173,8 @@ if peer.client_accepted:
   meter leaves them empty, as Itron does.
 - **`to_dict()` / `from_dict()`** exist on snapshots, measurements, intervals, profiles, `MeterInfo`, `Identity` and
   `ReadingGuard`, for caches, test fixtures and diagnostics. `from_dict()` accepts any mapping and raises
-  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`), except that `ReadingGuard.from_dict()` skips
-  malformed entries one by one and keeps the rest; anything that is not a mapping restores nothing.
+  `ProfileError` for malformed data (`Identity`: `InvalidIdentity`), except `ReadingGuard.from_dict()`, which
+  restores its own `to_dict()` output (and 0.3.x state).
 
 ## Client identity
 

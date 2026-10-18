@@ -266,7 +266,7 @@ class ReadingGuard:
 
     @property
     def _hold_margin(self) -> float:
-        """The largest glitch the growth bound can let through, in Wh."""
+        """The largest glitch the growth bound lets through while the meter is polled steadily, in Wh."""
         return self.max_power * self.max_refresh / 3600 + _SLACK_WH
 
     def _adopt(self, key: str, value: float, now: float) -> None:
@@ -322,7 +322,7 @@ class ReadingGuard:
 
     def restore(self, data: Any) -> None:
         """Load :meth:`to_dict` output (also 0.3.x state) into this guard, e.g. one
-        built with other limits. Entries that do not parse are skipped."""
+        built with other limits."""
         if not isinstance(data, Mapping):
             return
         for key, reading in _items(data.get("registers")):
