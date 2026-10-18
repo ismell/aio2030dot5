@@ -24,7 +24,8 @@ trusted publishing: no API token exists anywhere.
    `src/aio2030dot5/__init__.py`; merge to `main` with CI green.
 2. Optional dry run: run the Release workflow by hand on `main`. It publishes
    `<version>.devN` to TestPyPI; check the page and `pip install` it from there.
-3. Tag and push: `git tag -s v<version> -m v<version> && git push origin v<version>`.
+3. Tag and push: `git tag -a v<version> -m v<version> && git push origin v<version>`
+   (`-s` instead of `-a` signs the tag, if you have a signing key on GitHub).
    The workflow runs the full CI, checks that the tag matches `__version__`,
    builds, and waits for the `pypi` environment's approval before publishing.
 4. Create the GitHub release from the tag, with the CHANGELOG entry as notes.

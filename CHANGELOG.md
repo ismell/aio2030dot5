@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (first release on PyPI)
+## 0.4.0 (2026-10-18, first release on PyPI)
 
 Changes since the last pre-release (0.3.3).
 
